@@ -25,7 +25,7 @@ from src.countries.base import (
     TaxResult,
 )
 from src.countries.cz.config import CzTaxConfig
-from src.countries.cz.enums import CzHoldingTestRule, CzTaxSection
+from src.countries.cz.enums import CzTaxSection
 from src.countries.cz.fx_policy import CzFxPolicyConfig
 from src.countries.cz.plugin import (
     CzechOutputRenderer,
@@ -193,10 +193,11 @@ class TestCzechTaxClassifier:
         assert rgl.teilfreistellung_rate_applied is None
 
     def test_holding_test_exempt_3y(self):
-        """Securities held > 3 years should be exempt."""
+        """Classifier no longer pre-exempts — always CZ_10_SECURITIES.
+        Time test is applied later by evaluate_time_test() on CzTaxItem."""
         rgl = _make_rgl(AssetCategory.STOCK, Decimal("500"), holding_period_days=1200)
         self.classifier.classify(rgl)
-        assert rgl.cz_tax_section == CzTaxSection.CZ_EXEMPT_TIME_TEST
+        assert rgl.cz_tax_section == CzTaxSection.CZ_10_SECURITIES
 
     def test_holding_test_not_exempt_short(self):
         """Securities held < 3 years should be taxable."""
@@ -211,10 +212,10 @@ class TestCzechTaxClassifier:
         assert rgl.cz_tax_section == CzTaxSection.CZ_10_SECURITIES
 
     def test_holding_test_one_day_over(self):
-        """1096 days — should be exempt."""
+        """Classifier always assigns CZ_10_SECURITIES regardless of holding period."""
         rgl = _make_rgl(AssetCategory.STOCK, Decimal("500"), holding_period_days=1096)
         self.classifier.classify(rgl)
-        assert rgl.cz_tax_section == CzTaxSection.CZ_EXEMPT_TIME_TEST
+        assert rgl.cz_tax_section == CzTaxSection.CZ_10_SECURITIES
 
     def test_options_no_holding_test(self):
         """Options are not subject to the holding-period test."""
@@ -223,16 +224,16 @@ class TestCzechTaxClassifier:
         assert rgl.cz_tax_section == CzTaxSection.CZ_10_OPTIONS
 
     def test_custom_holding_test_years(self):
-        """Config override for holding_test_years."""
+        """Classifier always assigns CZ_10_SECURITIES — time test is on CzTaxItem."""
         cfg = CzTaxConfig(holding_test_years=5)
         classifier = CzechTaxClassifier(config=cfg)
         rgl = _make_rgl(AssetCategory.STOCK, Decimal("500"), holding_period_days=1500)
         classifier.classify(rgl)
-        assert rgl.cz_tax_section == CzTaxSection.CZ_10_SECURITIES  # 1500 < 5*365=1825
+        assert rgl.cz_tax_section == CzTaxSection.CZ_10_SECURITIES
 
         rgl2 = _make_rgl(AssetCategory.STOCK, Decimal("500"), holding_period_days=1900)
         classifier.classify(rgl2)
-        assert rgl2.cz_tax_section == CzTaxSection.CZ_EXEMPT_TIME_TEST
+        assert rgl2.cz_tax_section == CzTaxSection.CZ_10_SECURITIES
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +329,7 @@ class TestCzechTaxAggregator:
         sec = result.sections["cz_10_securities"]
         assert sec.line_items["taxable_gains_eur"] == Decimal("500.00")
         assert sec.line_items["deductible_losses_eur"] == Decimal("200.00")
-        assert sec.line_items["net_eur"] == Decimal("300.00")
+        assert sec.line_items["net_taxable_eur"] == Decimal("300.00")
 
 
 # ---------------------------------------------------------------------------
@@ -423,18 +424,18 @@ class TestCzEndToEnd:
         sec = result.sections["cz_10_securities"]
         assert sec.line_items["taxable_gains_eur"] == Decimal("1200.00")
         assert sec.line_items["deductible_losses_eur"] == Decimal("300.00")
-        assert sec.line_items["net_eur"] == Decimal("900.00")
+        assert sec.line_items["net_taxable_eur"] == Decimal("900.00")
 
         # Options: 500 gain, 100 loss
         opt = result.sections["cz_10_options"]
         assert opt.line_items["taxable_gains_eur"] == Decimal("500.00")
         assert opt.line_items["deductible_losses_eur"] == Decimal("100.00")
-        assert opt.line_items["net_eur"] == Decimal("400.00")
+        assert opt.line_items["net_taxable_eur"] == Decimal("400.00")
 
-        # Dividends — WHT is unlinked (no explicit taxed_income_event_id)
-        # so wht_paid may be 0 in the section total
+        # Dividends: 150 EUR dividend + 22.50 EUR unlinked WHT standalone item
+        # (unlinked WHT creates a standalone item in CZ_8_DIVIDENDS)
         div_sec = result.sections["cz_8_dividends"]
-        assert div_sec.line_items["gross_dividends_eur"] == Decimal("150.00")
+        assert div_sec.line_items["gross_dividends_eur"] == Decimal("172.50")
 
         # Interest
         intr = result.sections["cz_8_interest"]

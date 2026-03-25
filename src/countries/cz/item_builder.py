@@ -19,7 +19,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 import uuid
 
-from src.countries.cz.enums import CzTaxSection
+from src.countries.cz.enums import CzTaxSection, category_to_cz_section
 from src.countries.cz.fx_policy import CzCurrencyConverter, FxConversionRecord
 from src.countries.cz.tax_items import CzTaxItem, CzTaxItemType, CzWhtRecord
 from src.domain.assets import Asset
@@ -34,19 +34,6 @@ from src.identification.asset_resolver import AssetResolver
 from src.utils.type_utils import parse_ibkr_date
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Category → section mapping
-# ---------------------------------------------------------------------------
-
-_CATEGORY_TO_SECTION = {
-    AssetCategory.STOCK: CzTaxSection.CZ_10_SECURITIES,
-    AssetCategory.BOND: CzTaxSection.CZ_10_SECURITIES,
-    AssetCategory.INVESTMENT_FUND: CzTaxSection.CZ_10_SECURITIES,
-    AssetCategory.OPTION: CzTaxSection.CZ_10_OPTIONS,
-    AssetCategory.CFD: CzTaxSection.CZ_10_OPTIONS,
-    AssetCategory.PRIVATE_SALE_ASSET: CzTaxSection.CZ_10_SECURITIES,
-}
 
 _OPTION_REALIZATION_TYPES = {
     RealizationType.OPTION_TRADE_CLOSE_LONG,
@@ -95,14 +82,19 @@ def build_tax_items(
     )
 
     # --- Phase 2: link WHT to income items ---
-    _link_wht(income_items, wht_index, asset_resolver, fx, fx_records)
+    unlinked_wht_ids = _link_wht(income_items, wht_index, asset_resolver, fx, fx_records)
+
+    # --- Phase 2b: create standalone items for unlinked WHT ---
+    unlinked_items = _build_unlinked_wht_items(
+        unlinked_wht_ids, wht_index, asset_resolver, fx, fx_records,
+    )
 
     # --- Phase 3: disposal items from RGLs ---
     disposal_items = _build_disposal_items(
         realized_gains_losses, asset_resolver, fx, fx_records,
     )
 
-    all_items = income_items + disposal_items
+    all_items = income_items + unlinked_items + disposal_items
     return all_items, fx_records
 
 
@@ -216,14 +208,15 @@ def _link_wht(
     resolver: AssetResolver,
     fx: Optional[CzCurrencyConverter],
     fx_records: List[FxConversionRecord],
-) -> None:
+) -> set:
     """Attach WHT events to their parent income items.
 
     Linking strategy (in priority order):
     1. ``wht.taxed_income_event_id`` matches an income item's ``source_event_id``.
     2. Same ``asset_internal_id`` + same ``event_date``.
     3. Same ``asset_internal_id`` (nearest date, ±3 days).
-    Unlinked WHT events become standalone records on a synthetic item.
+
+    Returns the set of WHT event IDs that could NOT be linked.
     """
     linked_wht_ids: set = set()
 
@@ -267,7 +260,8 @@ def _link_wht(
                     target = best
 
         if target is None:
-            continue  # unlinked WHT — will appear in aggregated totals only
+            # Cannot link — will be emitted as standalone item
+            continue
 
         # Build WHT record
         orig_amt = wht.gross_amount_foreign_currency
@@ -291,6 +285,69 @@ def _link_wht(
         target.wht_records.append(wht_rec)
         linked_wht_ids.add(wht_id)
 
+    return set(wht_events.keys()) - linked_wht_ids
+
+
+# --- Unlinked WHT items ----------------------------------------------------
+
+def _build_unlinked_wht_items(
+    unlinked_ids: set,
+    wht_events: Dict[uuid.UUID, WithholdingTaxEvent],
+    resolver: AssetResolver,
+    fx: Optional[CzCurrencyConverter],
+    fx_records: List[FxConversionRecord],
+) -> List[CzTaxItem]:
+    """Create standalone ``CzTaxItem`` for each WHT that could not be linked.
+
+    These items appear in the output with ``item_type=OTHER`` and carry
+    the WHT as a self-referencing ``CzWhtRecord`` so the amount is not lost.
+    """
+    items: List[CzTaxItem] = []
+    for wht_id in unlinked_ids:
+        wht = wht_events.get(wht_id)
+        if wht is None:
+            continue
+
+        orig_amt = wht.gross_amount_foreign_currency
+        orig_cur = wht.local_currency
+        if orig_amt is not None and orig_cur is not None:
+            czk, fx_rec = _convert(orig_amt, orig_cur, wht.event_date, fx, fx_records)
+        else:
+            orig_amt = wht.gross_amount_eur or Decimal(0)
+            orig_cur = "EUR"
+            czk, fx_rec = _convert_eur(wht.gross_amount_eur, wht.event_date, fx, fx_records)
+
+        asset = resolver.get_asset_by_id(wht.asset_internal_id)
+        meta = _asset_meta(asset)
+
+        wht_rec = CzWhtRecord(
+            wht_event_id=wht.event_id,
+            event_date=wht.event_date,
+            original_amount=orig_amt if orig_amt is not None else Decimal(0),
+            original_currency=orig_cur or "EUR",
+            amount_czk=czk,
+            fx=fx_rec,
+            source_country=getattr(wht, "source_country_code", None),
+        )
+
+        item = CzTaxItem(
+            item_type=CzTaxItemType.OTHER,
+            section=CzTaxSection.CZ_8_DIVIDENDS,  # WHT most commonly relates to dividends
+            source_event_id=wht.event_id,
+            event_date=wht.event_date,
+            original_amount=orig_amt,
+            original_currency=orig_cur,
+            amount_eur=wht.gross_amount_eur,
+            amount_czk=czk,
+            fx=fx_rec,
+            wht_records=[wht_rec],
+            **meta,
+        )
+        item.tax_review_note = "Unlinked WHT — no matching income event found"
+        items.append(item)
+
+    return items
+
 
 # --- Disposal items --------------------------------------------------------
 
@@ -305,7 +362,7 @@ def _build_disposal_items(
     for rgl in rgls:
         cat = rgl.asset_category_at_realization
         # Prefer classifier's section if already set on the RGL
-        section = getattr(rgl, "cz_tax_section", None) or _CATEGORY_TO_SECTION.get(cat, CzTaxSection.CZ_10_SECURITIES)
+        section = getattr(rgl, "cz_tax_section", None) or category_to_cz_section(cat.name)
 
         # Determine item type
         if cat in (AssetCategory.OPTION, AssetCategory.CFD):

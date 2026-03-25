@@ -26,14 +26,15 @@ from src.countries.base import (
     TaxResultSection,
 )
 from src.countries.cz.config import CzTaxConfig
-from src.countries.cz.enums import CzHoldingTestRule, CzTaxSection
+from src.countries.cz.enums import CzTaxSection, category_to_cz_section
 from src.countries.cz.fx_policy import (
     CzCurrencyConverter,
     CzFxPolicyConfig,
     FxConversionRecord,
 )
 from src.countries.cz.item_builder import build_tax_items
-from src.countries.cz.tax_items import CzTaxItem, CzTaxItemType, CzWhtRecord
+from src.countries.cz.tax_items import CzTaxItem, CzTaxItemType, CzTaxReviewStatus, CzWhtRecord
+from src.countries.cz.time_test import evaluate_time_test
 from src.domain.assets import Asset
 from src.domain.enums import AssetCategory, FinancialEventType
 from src.domain.events import (
@@ -57,41 +58,22 @@ class CzechTaxClassifier:
     """
     Assigns a ``CzTaxSection`` to each ``RealizedGainLoss``.
 
-    The section is stored in ``rgl.tax_reporting_category`` as a *string*
-    (the enum name) because the core ``RealizedGainLoss`` field is typed
-    ``Optional[TaxReportingCategory]`` (German enum).  During this skeleton
-    phase we store the CZ section name in a new attribute instead.
-
-    PLACEHOLDER: holding-period test logic is simplified;
-    full implementation needs acquisition-date analysis.
+    Sets ``rgl.cz_tax_section`` to the appropriate bucket (§8 or §10).
+    Time-test exemption is applied **later** by ``evaluate_time_test()``
+    on the ``CzTaxItem`` level, not here.
     """
 
     def __init__(self, config: Optional[CzTaxConfig] = None):
         self.config = config or CzTaxConfig()
-
-    # ---- public API (satisfies TaxClassifier Protocol) ----
 
     def classify(
         self,
         rgl: RealizedGainLoss,
         asset: Optional[Asset] = None,
     ) -> None:
-        """Classify *rgl* in-place for Czech tax purposes.
-
-        Sets ``rgl.cz_tax_section`` (a dynamic attribute) to a
-        ``CzTaxSection`` enum value.  Also sets
-        ``net_gain_loss_after_teilfreistellung_eur`` to ``gross_gain_loss_eur``
-        (CZ has no partial exemption for funds).
-        """
         cat = rgl.asset_category_at_realization
-        section = self._map_category_to_section(cat)
+        section = category_to_cz_section(cat.name)
 
-        # Holding-period exemption check for securities
-        if section == CzTaxSection.CZ_10_SECURITIES:
-            if self._is_exempt_by_holding_test(rgl):
-                section = CzTaxSection.CZ_EXEMPT_TIME_TEST
-
-        # Store CZ section as dynamic attribute (core RGL has no CZ field)
         rgl.cz_tax_section = section  # type: ignore[attr-defined]
 
         # CZ has no Teilfreistellung — net = gross
@@ -99,34 +81,6 @@ class CzechTaxClassifier:
             rgl.net_gain_loss_after_teilfreistellung_eur = rgl.gross_gain_loss_eur
         else:
             rgl.net_gain_loss_after_teilfreistellung_eur = None
-
-    # ---- internals ----
-
-    @staticmethod
-    def _map_category_to_section(cat: AssetCategory) -> CzTaxSection:
-        """Map core ``AssetCategory`` → ``CzTaxSection``."""
-        _MAP = {
-            AssetCategory.STOCK: CzTaxSection.CZ_10_SECURITIES,
-            AssetCategory.BOND: CzTaxSection.CZ_10_SECURITIES,
-            AssetCategory.INVESTMENT_FUND: CzTaxSection.CZ_10_SECURITIES,
-            AssetCategory.OPTION: CzTaxSection.CZ_10_OPTIONS,
-            AssetCategory.CFD: CzTaxSection.CZ_10_OPTIONS,
-            AssetCategory.PRIVATE_SALE_ASSET: CzTaxSection.CZ_10_SECURITIES,
-        }
-        return _MAP.get(cat, CzTaxSection.CZ_10_SECURITIES)
-
-    def _is_exempt_by_holding_test(self, rgl: RealizedGainLoss) -> bool:
-        """PLACEHOLDER: simplified 3-year test.
-
-        Full implementation needs:
-        - acquisition date vs. 2014-01-01 threshold
-        - annual CZK 100k limit (2025+ amendment)
-        - fund-specific rules
-        """
-        threshold_days = self.config.holding_test_years * 365
-        if rgl.holding_period_days is not None and rgl.holding_period_days > threshold_days:
-            return True
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -172,46 +126,85 @@ class CzechTaxAggregator:
             fx=self._fx,
         )
 
-        # --- Aggregate by section ---
-        dividend_amt = ZERO
-        dividend_wht = ZERO
-        interest_amt = ZERO
+        # --- Apply time test (sets taxability fields in-place) ---
+        evaluate_time_test(items, self.config)
 
-        sec_gains = ZERO
-        sec_losses = ZERO
-        opt_gains = ZERO
-        opt_losses = ZERO
-
-        # Determine amount field: CZK if converter available, else EUR
+        # --- Determine amount field: CZK if converter available, else EUR ---
         has_fx = self._fx is not None
+
+        def _gl(it: CzTaxItem) -> Decimal:
+            return (it.gain_loss_czk if has_fx else it.gain_loss_eur) or ZERO
+
+        def _amt(it: CzTaxItem) -> Decimal:
+            return (it.amount_czk if has_fx else it.amount_eur) or ZERO
+
+        # --- Aggregate by section, split by taxability ---
+        # §8 dividends
+        div_taxable = ZERO
+        div_exempt = ZERO
+        div_pending = ZERO
+        div_wht = ZERO
+        div_count = div_exempt_count = div_pending_count = 0
+
+        # §8 interest
+        int_taxable = ZERO
+        int_count = 0
+
+        # §10 securities
+        sec_taxable_gains = ZERO
+        sec_taxable_losses = ZERO
+        sec_exempt_total = ZERO
+        sec_pending_total = ZERO
+        sec_total = sec_exempt_count = sec_pending_count = 0
+
+        # §10 options
+        opt_taxable_gains = ZERO
+        opt_taxable_losses = ZERO
+        opt_total = 0
 
         for it in items:
             if it.section == CzTaxSection.CZ_8_DIVIDENDS:
-                amt = (it.amount_czk if has_fx else it.amount_eur) or ZERO
-                dividend_amt += amt
-                dividend_wht += it.total_wht_czk() if has_fx else sum(
-                    (r.original_amount for r in it.wht_records), ZERO
-                )
+                amt = _amt(it)
+                div_count += 1
+                if it.included_in_tax_base:
+                    div_taxable += amt
+                    div_wht += it.total_wht_czk() if has_fx else sum(
+                        (r.original_amount for r in it.wht_records), ZERO
+                    )
+                # Dividends are always taxable — no exempt/pending split needed
 
             elif it.section == CzTaxSection.CZ_8_INTEREST:
-                amt = (it.amount_czk if has_fx else it.amount_eur) or ZERO
-                interest_amt += amt
+                int_count += 1
+                if it.included_in_tax_base:
+                    int_taxable += _amt(it)
 
             elif it.section == CzTaxSection.CZ_10_SECURITIES:
-                gl = (it.gain_loss_czk if has_fx else it.gain_loss_eur) or ZERO
-                if gl >= ZERO:
-                    sec_gains += gl
-                else:
-                    sec_losses += gl.copy_abs()
+                gl = _gl(it)
+                sec_total += 1
+                if it.tax_review_status == CzTaxReviewStatus.PENDING_MANUAL_REVIEW:
+                    sec_pending_count += 1
+                    sec_pending_total += gl.copy_abs()
+                elif it.is_exempt:
+                    sec_exempt_count += 1
+                    sec_exempt_total += gl.copy_abs()
+                # Only included_in_tax_base items go into taxable gains/losses
+                if it.included_in_tax_base:
+                    if gl >= ZERO:
+                        sec_taxable_gains += gl
+                    else:
+                        sec_taxable_losses += gl.copy_abs()
 
             elif it.section == CzTaxSection.CZ_10_OPTIONS:
-                gl = (it.gain_loss_czk if has_fx else it.gain_loss_eur) or ZERO
-                if gl >= ZERO:
-                    opt_gains += gl
-                else:
-                    opt_losses += gl.copy_abs()
+                gl = _gl(it)
+                opt_total += 1
+                if it.included_in_tax_base:
+                    if gl >= ZERO:
+                        opt_taxable_gains += gl
+                    else:
+                        opt_taxable_losses += gl.copy_abs()
 
         cur = "CZK" if has_fx else "EUR"
+        c = cur.lower()
 
         # --- Build TaxResult sections ---
         sections: Dict[str, TaxResultSection] = {}
@@ -220,8 +213,9 @@ class CzechTaxAggregator:
             section_key="cz_8_dividends",
             label=self.config.section_labels.get("cz_8_dividends", "§8 – Dividendy"),
             line_items={
-                f"gross_dividends_{cur.lower()}": dividend_amt.quantize(TWO),
-                f"wht_paid_{cur.lower()}": dividend_wht.quantize(TWO),
+                f"gross_dividends_{c}": div_taxable.quantize(TWO),
+                f"wht_paid_{c}": div_wht.quantize(TWO),
+                "item_count": Decimal(div_count),
             },
             notes=([] if has_fx else ["no FX converter — amounts in EUR"]),
         )
@@ -230,7 +224,8 @@ class CzechTaxAggregator:
             section_key="cz_8_interest",
             label=self.config.section_labels.get("cz_8_interest", "§8 – Úroky"),
             line_items={
-                f"gross_interest_{cur.lower()}": interest_amt.quantize(TWO),
+                f"gross_interest_{c}": int_taxable.quantize(TWO),
+                "item_count": Decimal(int_count),
             },
             notes=([] if has_fx else ["no FX converter — amounts in EUR"]),
         )
@@ -239,9 +234,14 @@ class CzechTaxAggregator:
             section_key="cz_10_securities",
             label=self.config.section_labels.get("cz_10_securities", "§10 – Cenné papíry"),
             line_items={
-                f"taxable_gains_{cur.lower()}": sec_gains.quantize(TWO),
-                f"deductible_losses_{cur.lower()}": sec_losses.quantize(TWO),
-                f"net_{cur.lower()}": (sec_gains - sec_losses).quantize(TWO),
+                f"taxable_gains_{c}": sec_taxable_gains.quantize(TWO),
+                f"deductible_losses_{c}": sec_taxable_losses.quantize(TWO),
+                f"net_taxable_{c}": (sec_taxable_gains - sec_taxable_losses).quantize(TWO),
+                f"exempt_total_{c}": sec_exempt_total.quantize(TWO),
+                f"pending_review_{c}": sec_pending_total.quantize(TWO),
+                "item_count_total": Decimal(sec_total),
+                "item_count_exempt": Decimal(sec_exempt_count),
+                "item_count_pending": Decimal(sec_pending_count),
             },
             notes=["PLACEHOLDER: expense deduction rules (§10/4 ZDP) not applied"],
         )
@@ -250,9 +250,10 @@ class CzechTaxAggregator:
             section_key="cz_10_options",
             label=self.config.section_labels.get("cz_10_options", "§10 – Opce a deriváty"),
             line_items={
-                f"taxable_gains_{cur.lower()}": opt_gains.quantize(TWO),
-                f"deductible_losses_{cur.lower()}": opt_losses.quantize(TWO),
-                f"net_{cur.lower()}": (opt_gains - opt_losses).quantize(TWO),
+                f"taxable_gains_{c}": opt_taxable_gains.quantize(TWO),
+                f"deductible_losses_{c}": opt_taxable_losses.quantize(TWO),
+                f"net_taxable_{c}": (opt_taxable_gains - opt_taxable_losses).quantize(TWO),
+                "item_count": Decimal(opt_total),
             },
             notes=[],
         )

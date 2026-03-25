@@ -318,12 +318,15 @@ class TestAggregatorWithFxConversion:
         assert cr["currency"] == "CZK"
 
     def test_line_item_keys_use_czk_suffix(self):
+        """Amount keys should end with _czk; metadata keys (item_count*) are excluded."""
         rgl = _make_rgl(Decimal("100"), realization_date="2025-03-25")
         self.classifier.classify(rgl)
         agg = self._make_aggregator()
         result = agg.aggregate([rgl], [], self.resolver, 2025)
         for sec_key, section in result.sections.items():
             for item_key in section.line_items:
+                if item_key.startswith("item_count"):
+                    continue  # metadata, not a currency amount
                 assert item_key.endswith("_czk"), (
                     f"Section {sec_key} item '{item_key}' should end with _czk"
                 )

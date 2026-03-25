@@ -17,7 +17,11 @@ from enum import Enum, auto
 
 
 class CzTaxSection(Enum):
-    """High-level Czech tax form sections for income classification."""
+    """High-level Czech tax form sections for income classification.
+
+    Exemption status is tracked per-item on ``CzTaxItem.is_exempt``,
+    NOT as a separate section value.
+    """
 
     # §8 ZDP — Příjmy z kapitálového majetku
     CZ_8_DIVIDENDS = auto()      # Dividendy ze zahraničí
@@ -27,18 +31,20 @@ class CzTaxSection(Enum):
     CZ_10_SECURITIES = auto()    # Prodej cenných papírů (akcie, dluhopisy, fondy)
     CZ_10_OPTIONS = auto()       # Opce a deriváty
 
-    # Exempt / non-taxable
-    CZ_EXEMPT_TIME_TEST = auto() # Osvobozeno – splněn časový test (§4/1/w ZDP)
-    CZ_EXEMPT_OTHER = auto()     # Osvobozeno – jiný důvod
 
+def category_to_cz_section(asset_category_name: str) -> CzTaxSection:
+    """Map a core ``AssetCategory`` name to a ``CzTaxSection``.
 
-class CzHoldingTestRule(Enum):
+    Single source of truth — used by both the classifier and item builder.
+    Accepts the enum *name* (string) to avoid importing ``AssetCategory``
+    into this low-level enum module.
     """
-    Holding period rules for Czech tax exemption (§4 odst. 1 písm. w ZDP).
-
-    PLACEHOLDER: actual thresholds depend on acquisition date
-    and legislative changes (2014 → 3 years, pre-2014 → 6 months).
-    """
-    SECURITIES_3Y = auto()       # Cenné papíry nabyté po 1.1.2014: 3 roky
-    SECURITIES_OLD_6M = auto()   # Cenné papíry nabyté před 1.1.2014: 6 měsíců
-    NOT_APPLICABLE = auto()      # Časový test se neuplatňuje (deriváty, úroky…)
+    _MAP = {
+        "STOCK": CzTaxSection.CZ_10_SECURITIES,
+        "BOND": CzTaxSection.CZ_10_SECURITIES,
+        "INVESTMENT_FUND": CzTaxSection.CZ_10_SECURITIES,
+        "OPTION": CzTaxSection.CZ_10_OPTIONS,
+        "CFD": CzTaxSection.CZ_10_OPTIONS,
+        "PRIVATE_SALE_ASSET": CzTaxSection.CZ_10_SECURITIES,
+    }
+    return _MAP.get(asset_category_name, CzTaxSection.CZ_10_SECURITIES)

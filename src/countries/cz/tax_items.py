@@ -45,6 +45,18 @@ class CzTaxItemType(Enum):
     OTHER = auto()
 
 
+class CzTaxReviewStatus(Enum):
+    """Tax-classification review status for a CzTaxItem."""
+    RESOLVED = auto()              # Taxability fully determined
+    PENDING_MANUAL_REVIEW = auto() # Missing data — needs human input
+
+
+class CzExemptionReason(Enum):
+    """Why a CzTaxItem is exempt from Czech income tax."""
+    TIME_TEST_PASSED = auto()      # §4/1/w ZDP — holding period exceeded
+    NOT_APPLICABLE = auto()        # Item type not subject to exemption test
+
+
 # ---------------------------------------------------------------------------
 # Withholding-tax record linked to a parent income item
 # ---------------------------------------------------------------------------
@@ -134,6 +146,14 @@ class CzTaxItem:
     # --- Quantity (for disposals) ---
     quantity: Optional[Decimal] = None
 
+    # --- Taxability classification (set by CzTimeTestEvaluator) ---
+    is_taxable: bool = True
+    is_exempt: bool = False
+    exemption_reason: Optional[CzExemptionReason] = None
+    included_in_tax_base: bool = True
+    tax_review_status: CzTaxReviewStatus = CzTaxReviewStatus.RESOLVED
+    tax_review_note: Optional[str] = None
+
     def total_wht_czk(self) -> Decimal:
         """Sum of all linked WHT amounts in CZK."""
         return sum(
@@ -168,6 +188,14 @@ class CzTaxItem:
             "wht_total_czk": str(self.total_wht_czk()),
             "wht_records": [r.to_dict() for r in self.wht_records],
         }
+        # --- Taxability ---
+        d["is_taxable"] = self.is_taxable
+        d["is_exempt"] = self.is_exempt
+        d["exemption_reason"] = self.exemption_reason.name if self.exemption_reason else None
+        d["included_in_tax_base"] = self.included_in_tax_base
+        d["tax_review_status"] = self.tax_review_status.name
+        d["tax_review_note"] = self.tax_review_note
+        # --- FX ---
         if self.fx is not None:
             d["fx_source"] = self.fx.fx_source
             d["fx_policy"] = self.fx.fx_policy

@@ -34,12 +34,18 @@ class CzTaxConfig:
     elevated_tax_rate: Decimal = Decimal("0.23")
     elevated_rate_threshold_czk: Decimal = Decimal("1935552")
 
-    # --- Holding-period test (§4/1/w ZDP) ---
+    # --- Holding-period time test (§4/1/w ZDP) ---
     # Securities acquired after 2014-01-01: exempt if held > 3 years.
+    time_test_enabled: bool = True
     holding_test_years: int = 3
     # PLACEHOLDER: CZK 100 000 annual limit on exempt disposals
     # introduced by 2025 amendment; set to 0 to disable.
     annual_exempt_limit_czk: Decimal = Decimal("0")
+
+    @property
+    def holding_test_days(self) -> int:
+        """Threshold in days (years * 365). Item must exceed this to be exempt."""
+        return self.holding_test_years * 365
 
     # --- Withholding tax credit (§38f ZDP) ---
     # Method: proportional credit (zápočet daně).
