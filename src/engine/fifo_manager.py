@@ -5,15 +5,20 @@ from typing import List, Optional, Tuple
 import uuid
 from datetime import date as date_obj, datetime
 
-from src.domain.assets import Asset, Option 
-from src.domain.events import FinancialEvent, TradeEvent, CorpActionSplitForward, CorpActionMergerCash, CorpActionStockDividend 
+from src.domain.assets import Asset, Option
+from src.domain.events import FinancialEvent, TradeEvent, CorpActionSplitForward, CorpActionMergerCash, CorpActionStockDividend
 from src.domain.results import RealizedGainLoss
-from src.domain.enums import AssetCategory, FinancialEventType, TaxReportingCategory, RealizationType, InvestmentFundType 
+from src.domain.enums import AssetCategory, FinancialEventType, TaxReportingCategory, RealizationType, InvestmentFundType
 from src.utils.currency_converter import CurrencyConverter
 from src.utils.exchange_rate_provider import ECBExchangeRateProvider
 from src.utils.type_utils import parse_ibkr_date, safe_decimal
-from src.utils.tax_utils import get_teilfreistellung_rate_for_fund_type 
+from src.utils.tax_utils import get_teilfreistellung_rate_for_fund_type
 import src.config as global_config
+
+# Type alias for the optional tax classifier callback.
+# Any callable with signature (RealizedGainLoss, Optional[Asset]) -> None works.
+from typing import Callable
+_TaxClassifierCallable = Optional[Callable[[RealizedGainLoss], None]]
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +42,13 @@ class FifoLot:
 
         ctx_check = Context(prec=get_global_context().prec)
         expected_total = ctx_check.multiply(self.quantity, self.unit_cost_basis_eur) # Renamed
-        
+
         places_total = abs(global_config.OUTPUT_PRECISION_AMOUNTS.as_tuple().exponent) # Renamed
         places_unit = abs(global_config.OUTPUT_PRECISION_PER_SHARE.as_tuple().exponent) # Renamed
-        tolerance_exponent = min(places_total, places_unit) - 1 
+        tolerance_exponent = min(places_total, places_unit) - 1
         tolerance = Decimal('1e-' + str(tolerance_exponent))
 
-        if abs(self.total_cost_basis_eur - expected_total) > tolerance and expected_total != Decimal(0): 
+        if abs(self.total_cost_basis_eur - expected_total) > tolerance and expected_total != Decimal(0):
              logger.warning(
                  f"FifoLot {self.source_transaction_id}: total_cost_basis_eur {self.total_cost_basis_eur} "
                  f"differs significantly from (quantity {self.quantity} * unit_cost_basis_eur {self.unit_cost_basis_eur} = {expected_total}). " # Renamed
@@ -75,7 +80,7 @@ class ShortFifoLot:
         places_unit = abs(global_config.OUTPUT_PRECISION_PER_SHARE.as_tuple().exponent) # Renamed
         tolerance_exponent = min(places_total, places_unit) - 1
         tolerance = Decimal('1e-' + str(tolerance_exponent))
-        
+
         if abs(self.total_sale_proceeds_eur - expected_total) > tolerance and expected_total != Decimal(0):
             logger.warning(
                 f"ShortFifoLot {self.source_transaction_id}: total_sale_proceeds_eur {self.total_sale_proceeds_eur} "
@@ -95,15 +100,16 @@ class FifoLedger:
     def __init__(self,
                  asset_internal_id: uuid.UUID,
                  asset_category: AssetCategory,
-                 asset_multiplier_from_asset: Optional[Decimal], 
+                 asset_multiplier_from_asset: Optional[Decimal],
                  currency_converter: CurrencyConverter,
                  exchange_rate_provider: ECBExchangeRateProvider,
                  internal_working_precision: int, # Will be renamed internal_calculation_precision where called
                  decimal_rounding_mode: str,
-                 fund_type: Optional[InvestmentFundType] = None): 
+                 fund_type: Optional[InvestmentFundType] = None,
+                 tax_classifier: _TaxClassifierCallable = None):
         self.asset_internal_id: uuid.UUID = asset_internal_id
         self.asset_category: AssetCategory = asset_category
-        self.fund_type: Optional[InvestmentFundType] = fund_type 
+        self.fund_type: Optional[InvestmentFundType] = fund_type
 
         if self.asset_category == AssetCategory.INVESTMENT_FUND and self.fund_type is None:
             logger.warning(f"FifoLedger for Investment Fund {asset_internal_id} initialized without a specific fund_type. Defaulting to InvestmentFundType.NONE. This may impact tax calculations if not intended.")
@@ -125,6 +131,7 @@ class FifoLedger:
         self.exchange_rate_provider: ECBExchangeRateProvider = exchange_rate_provider
 
         self.ctx = Context(prec=internal_working_precision, rounding=decimal_rounding_mode)
+        self._tax_classifier: _TaxClassifierCallable = tax_classifier
         self.soy_fallback_lot_source_tx_id = f"SOY_FALLBACK_{asset_internal_id}"
         self.soy_fallback_short_lot_source_tx_id = f"SOY_FALLBACK_SHORT_{asset_internal_id}"
 
@@ -133,20 +140,20 @@ class FifoLedger:
                                  asset: Asset,
                                  all_historical_events_for_asset: List[FinancialEvent],
                                  tax_year: int):
-        
+
         if self.asset_category == AssetCategory.INVESTMENT_FUND:
-            asset_fund_type = getattr(asset, 'fund_type', None) 
+            asset_fund_type = getattr(asset, 'fund_type', None)
             if isinstance(asset_fund_type, InvestmentFundType) and asset_fund_type != InvestmentFundType.NONE:
                  if self.fund_type == InvestmentFundType.NONE:
                      logger.info(f"Updating FifoLedger fund_type for {self.asset_internal_id} from SOY asset object to {asset_fund_type}.")
                      self.fund_type = asset_fund_type
-            elif self.fund_type is None: 
+            elif self.fund_type is None:
                  logger.warning(f"FifoLedger for Investment Fund {self.asset_internal_id} still has no specific fund_type after asset load for SOY. Using InvestmentFundType.NONE.")
                  self.fund_type = InvestmentFundType.NONE
 
         self.lots.clear()
         self.short_lots.clear()
-        historical_simulation_inconsistent = False 
+        historical_simulation_inconsistent = False
 
         logger.info(f"Asset {asset.get_classification_key()} (ID: {asset.internal_asset_id}): Initializing SOY. "
                     f"Processing {len(all_historical_events_for_asset)} historical events for simulation.")
@@ -163,7 +170,7 @@ class FifoLedger:
                     if hist_event.event_type == FinancialEventType.TRADE_BUY_LONG:
                         self.add_long_lot(hist_event)
                     elif hist_event.event_type == FinancialEventType.TRADE_SELL_LONG:
-                        self.consume_long_lots_for_sale(hist_event, is_historical_simulation=True) 
+                        self.consume_long_lots_for_sale(hist_event, is_historical_simulation=True)
                     elif hist_event.event_type == FinancialEventType.TRADE_SELL_SHORT_OPEN:
                         self.add_short_lot(hist_event)
                     elif hist_event.event_type == FinancialEventType.TRADE_BUY_SHORT_COVER:
@@ -172,14 +179,14 @@ class FifoLedger:
                     self.adjust_lots_for_split(hist_event)
                 elif isinstance(hist_event, CorpActionStockDividend):
                      self.add_lot_for_stock_dividend(hist_event)
-            except UserWarning as uw: 
+            except UserWarning as uw:
                 logger.warning(f"Historical simulation warning for asset {asset.internal_asset_id} processing event {hist_event.event_id}: {uw}")
                 historical_simulation_inconsistent = True
 
 
-        reconstructed_long_lots_snapshot = list(self.lots) 
-        reconstructed_short_lots_snapshot = list(self.short_lots) 
-        self.lots.clear() 
+        reconstructed_long_lots_snapshot = list(self.lots)
+        reconstructed_short_lots_snapshot = list(self.short_lots)
+        self.lots.clear()
         self.short_lots.clear()
 
         reconstructed_total_long_qty = sum(lot.quantity for lot in reconstructed_long_lots_snapshot)
@@ -199,10 +206,10 @@ class FifoLedger:
             logger.info(f"Asset {asset.get_classification_key()}: Reported SOY quantity is 0. Initializing with no lots.")
             return
 
-        use_fallback = historical_simulation_inconsistent 
+        use_fallback = historical_simulation_inconsistent
 
-        if not use_fallback: 
-            if reported_soy_qty > Decimal(0): 
+        if not use_fallback:
+            if reported_soy_qty > Decimal(0):
                 if reconstructed_total_long_qty >= reported_soy_qty and reconstructed_total_short_qty_abs == Decimal(0):
                     logger.info(f"Asset {asset.get_classification_key()}: Using reconstructed FIFO long lots and costs.")
                     qty_to_assign = reported_soy_qty
@@ -219,11 +226,11 @@ class FifoLedger:
                         qty_to_assign -= qty_from_this_lot
                     if qty_to_assign.copy_abs() > Decimal('1e-8'):
                          logger.error(f"Asset {asset.get_classification_key()}: Mismatch after assigning sufficient long lots. Rem: {qty_to_assign}")
-                         use_fallback = True 
+                         use_fallback = True
                 else:
                     use_fallback = True
-            
-            elif reported_soy_qty < Decimal(0): 
+
+            elif reported_soy_qty < Decimal(0):
                 reported_soy_qty_abs = reported_soy_qty.copy_abs()
                 if reconstructed_total_short_qty_abs >= reported_soy_qty_abs and reconstructed_total_long_qty == Decimal(0):
                     logger.info(f"Asset {asset.get_classification_key()}: Using reconstructed FIFO short lots and proceeds.")
@@ -241,15 +248,15 @@ class FifoLedger:
                         qty_to_assign -= qty_from_this_lot
                     if qty_to_assign.copy_abs() > Decimal('1e-8'):
                          logger.error(f"Asset {asset.get_classification_key()}: Mismatch after assigning sufficient short lots. Rem: {qty_to_assign}")
-                         use_fallback = True 
+                         use_fallback = True
                 else:
                     use_fallback = True
-            else: 
+            else:
                  use_fallback = True
 
 
         if use_fallback:
-            self.lots.clear() 
+            self.lots.clear()
             self.short_lots.clear()
             logger.warning(f"Asset {asset.get_classification_key()}: Historical FIFO reconstruction "
                            f"(Long: {reconstructed_total_long_qty}, Short: {reconstructed_total_short_qty_abs}, Inconsistent: {historical_simulation_inconsistent}) "
@@ -258,7 +265,7 @@ class FifoLedger:
                 self._create_fallback_long_lot(asset, reported_soy_qty, tax_year)
             elif reported_soy_qty < Decimal(0):
                 self._create_fallback_short_lot(asset, reported_soy_qty.copy_abs(), tax_year)
-        
+
         if self.lots:
             self.lots.sort(key=lambda lot: (parse_ibkr_date(lot.acquisition_date) or datetime.min.date(), lot.source_transaction_id))
             if any((parse_ibkr_date(lot.acquisition_date) is None) for lot in self.lots):
@@ -280,7 +287,7 @@ class FifoLedger:
             if cost_basis_currency.upper() == "EUR":
                 total_cost_basis_eur = total_cost_basis_soy_curr
             else:
-                conversion_date_obj = date_obj(tax_year, 1, 1) 
+                conversion_date_obj = date_obj(tax_year, 1, 1)
                 converted_eur = self.currency_converter.convert_to_eur(
                     original_amount=total_cost_basis_soy_curr, original_currency=cost_basis_currency, date_of_conversion=conversion_date_obj
                 )
@@ -293,7 +300,7 @@ class FifoLedger:
                 logger.warning(f"Asset {asset.get_classification_key()} fallback SOY: Reported total cost basis {total_cost_basis_eur} EUR is negative. Using 0 for Qty {quantity}.")
                 total_cost_basis_eur = self.ctx.create_decimal(Decimal(0))
         cost_per_unit = self.ctx.divide(total_cost_basis_eur, quantity) if quantity != Decimal(0) else Decimal(0)
-        acquisition_date_str = f"{tax_year-1}-12-31" 
+        acquisition_date_str = f"{tax_year-1}-12-31"
         fallback_lot = FifoLot(
             acquisition_date=acquisition_date_str, quantity=quantity,
             unit_cost_basis_eur=cost_per_unit, total_cost_basis_eur=total_cost_basis_eur, # Renamed
@@ -317,7 +324,7 @@ class FifoLedger:
             if proceeds_currency.upper() == "EUR":
                 total_proceeds_eur = total_proceeds_soy_curr
             else:
-                conversion_date_obj = date_obj(tax_year, 1, 1) 
+                conversion_date_obj = date_obj(tax_year, 1, 1)
                 converted_eur = self.currency_converter.convert_to_eur(
                     original_amount=total_proceeds_soy_curr, original_currency=proceeds_currency, date_of_conversion=conversion_date_obj
                 )
@@ -327,7 +334,7 @@ class FifoLedger:
                 else:
                     total_proceeds_eur = self.ctx.create_decimal(converted_eur)
         proceeds_per_unit = self.ctx.divide(total_proceeds_eur, quantity_abs) if quantity_abs != Decimal(0) else Decimal(0)
-        opening_date_str = f"{tax_year-1}-12-31" 
+        opening_date_str = f"{tax_year-1}-12-31"
         fallback_short_lot = ShortFifoLot(
             opening_date=opening_date_str, quantity_shorted=quantity_abs,
             unit_sale_proceeds_eur=proceeds_per_unit, total_sale_proceeds_eur=total_proceeds_eur, # Renamed
@@ -355,7 +362,7 @@ class FifoLedger:
         cost_basis_eur_per_unit = self.ctx.divide(total_cost_basis_eur, lot_qty_contracts_or_units)
 
         new_lot = FifoLot(
-            acquisition_date=trade_event.event_date, quantity=lot_qty_contracts_or_units, 
+            acquisition_date=trade_event.event_date, quantity=lot_qty_contracts_or_units,
             unit_cost_basis_eur=cost_basis_eur_per_unit, # Renamed
             total_cost_basis_eur=total_cost_basis_eur,
             source_transaction_id=trade_event.ibkr_transaction_id
@@ -396,7 +403,7 @@ class FifoLedger:
 
     def consume_long_lots_for_sale(self, sale_event: TradeEvent, is_historical_simulation: bool = False) -> List[RealizedGainLoss]:
         if sale_event.event_type != FinancialEventType.TRADE_SELL_LONG: return []
-        if sale_event.quantity is None or sale_event.quantity >= Decimal(0): return [] 
+        if sale_event.quantity is None or sale_event.quantity >= Decimal(0): return []
         if sale_event.net_proceeds_or_cost_basis_eur is None: return []
 
         quantity_to_realize = sale_event.quantity.copy_abs().quantize(global_config.PRECISION_QUANTITY, context=self.ctx)
@@ -429,7 +436,7 @@ class FifoLedger:
                 current_lot.total_cost_basis_eur = self.ctx.multiply(current_lot.quantity, current_lot.unit_cost_basis_eur) # Renamed
 
             quantity_remaining_to_realize = self.ctx.subtract(quantity_remaining_to_realize, quantity_from_this_lot)
-            
+
             if not is_historical_simulation:
                 cost_basis_for_portion = self.ctx.multiply(quantity_from_this_lot, current_lot.unit_cost_basis_eur) # Renamed
                 realization_value_for_portion = self.ctx.multiply(quantity_from_this_lot, sale_proceeds_eur_per_unit_for_event)
@@ -441,90 +448,45 @@ class FifoLedger:
                 if acq_date_obj and real_date_obj and real_date_obj >= acq_date_obj :
                     holding_period_days = (real_date_obj - acq_date_obj).days
 
-                tax_cat: Optional[TaxReportingCategory] = None
-                is_stillhalter_income_flag = False # Renamed from is_premium_gain
-                is_taxable_under_section_23_flag = True # Renamed from is_taxable_under_rules_for_rgl
-                
-                rgl_fund_type: Optional[InvestmentFundType] = None
-                rgl_tf_rate: Optional[Decimal] = None
-
-                if self.asset_category == AssetCategory.STOCK:
-                    tax_cat = TaxReportingCategory.ANLAGE_KAP_AKTIEN_GEWINN if gross_gain_loss >= Decimal(0) else TaxReportingCategory.ANLAGE_KAP_AKTIEN_VERLUST
-                elif self.asset_category == AssetCategory.BOND:
-                    tax_cat = TaxReportingCategory.ANLAGE_KAP_SONSTIGE_KAPITALERTRAEGE if gross_gain_loss >= Decimal(0) else TaxReportingCategory.ANLAGE_KAP_SONSTIGE_VERLUSTE
-                elif self.asset_category in [AssetCategory.OPTION, AssetCategory.CFD]:
-                    tax_cat = TaxReportingCategory.ANLAGE_KAP_TERMIN_GEWINN if gross_gain_loss >= Decimal(0) else TaxReportingCategory.ANLAGE_KAP_TERMIN_VERLUST
-                elif self.asset_category == AssetCategory.INVESTMENT_FUND:
-                    rgl_fund_type = self.fund_type
-                    if rgl_fund_type is None: 
-                        logger.error(f"CRITICAL: FifoLedger for Investment Fund {self.asset_internal_id} (Event: {sale_event.event_id}) has self.fund_type as None. Defaulting to InvestmentFundType.NONE for RGL.")
-                        rgl_fund_type = InvestmentFundType.NONE
-                    
-                    rgl_tf_rate = get_teilfreistellung_rate_for_fund_type(rgl_fund_type)
-
-                    if rgl_fund_type == InvestmentFundType.AKTIENFONDS:
-                        tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_AKTIENFONDS_GEWINN_GROSS
-                    elif rgl_fund_type == InvestmentFundType.MISCHFONDS:
-                        tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_MISCHFONDS_GEWINN_GROSS
-                    elif rgl_fund_type == InvestmentFundType.IMMOBILIENFONDS:
-                        tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_IMMOBILIENFONDS_GEWINN_GROSS
-                    elif rgl_fund_type == InvestmentFundType.AUSLANDS_IMMOBILIENFONDS:
-                        tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_AUSLANDS_IMMOBILIENFONDS_GEWINN_GROSS
-                    elif rgl_fund_type in [InvestmentFundType.SONSTIGE_FONDS, InvestmentFundType.NONE]:
-                        tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_SONSTIGE_FONDS_GEWINN_GROSS
-                    else: 
-                        logger.error(f"Unhandled fund type '{rgl_fund_type}' for KAP-INV tax category. Asset {self.asset_internal_id}, Event {sale_event.event_id}.")
-                        tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_SONSTIGE_FONDS_GEWINN_GROSS 
-
-                elif self.asset_category == AssetCategory.PRIVATE_SALE_ASSET: # Renamed
-                    if holding_period_days is not None and holding_period_days <= 365:
-                        is_taxable_under_section_23_flag = True # Renamed
-                        tax_cat = TaxReportingCategory.SECTION_23_ESTG_TAXABLE_GAIN if gross_gain_loss >= Decimal(0) else TaxReportingCategory.SECTION_23_ESTG_TAXABLE_LOSS
-                    else: 
-                        is_taxable_under_section_23_flag = False # Renamed
-                        tax_cat = TaxReportingCategory.SECTION_23_ESTG_EXEMPT_HOLDING_PERIOD_MET
-                
                 rgl = RealizedGainLoss(
                     originating_event_id=sale_event.event_id, asset_internal_id=self.asset_internal_id,
                     asset_category_at_realization=self.asset_category, acquisition_date=current_lot.acquisition_date,
                     realization_date=sale_event.event_date,
                     realization_type=realization_type_for_rgl,
-                    quantity_realized=quantity_from_this_lot, 
-                    unit_cost_basis_eur=current_lot.unit_cost_basis_eur, # Renamed kwarg
-                    unit_realization_value_eur=sale_proceeds_eur_per_unit_for_event, # Renamed kwarg
-                    total_cost_basis_eur=cost_basis_for_portion, # Renamed kwarg
+                    quantity_realized=quantity_from_this_lot,
+                    unit_cost_basis_eur=current_lot.unit_cost_basis_eur,
+                    unit_realization_value_eur=sale_proceeds_eur_per_unit_for_event,
+                    total_cost_basis_eur=cost_basis_for_portion,
                     total_realization_value_eur=realization_value_for_portion,
                     gross_gain_loss_eur=gross_gain_loss, holding_period_days=holding_period_days,
-                    is_taxable_under_section_23=is_taxable_under_section_23_flag, # Renamed kwarg
-                    tax_reporting_category=tax_cat, 
-                    is_stillhalter_income=is_stillhalter_income_flag, # Renamed kwarg
-                    fund_type_at_sale=rgl_fund_type if self.asset_category == AssetCategory.INVESTMENT_FUND else None,
-                    teilfreistellung_rate_applied=rgl_tf_rate if self.asset_category == AssetCategory.INVESTMENT_FUND else None
+                    fund_type_at_sale=self.fund_type if self.asset_category == AssetCategory.INVESTMENT_FUND else None,
                 )
+                if self._tax_classifier is not None:
+                    self._tax_classifier(rgl)
                 realized_gains_losses.append(rgl)
 
         for i in sorted(lots_to_remove_indices, reverse=True): del self.lots[i]
 
-        small_tolerance_qty = Decimal('1e-10') 
+        small_tolerance_qty = Decimal('1e-10')
         if quantity_remaining_to_realize.copy_abs() > small_tolerance_qty:
             msg = (f"Insufficient long lots for sale event {sale_event.ibkr_transaction_id or sale_event.event_id} "
                    f"for asset {self.asset_internal_id}. Required to sell: {quantity_to_realize}, "
-                   f"Total available in lots before this sale: {current_available_qty_in_lots}, " 
+                   f"Total available in lots before this sale: {current_available_qty_in_lots}, "
                    f"Remaining to sell after processing lots: {quantity_remaining_to_realize}.")
             if is_historical_simulation:
                 logger.warning(f"Historical Simulation: {msg}")
-                raise UserWarning(msg) 
+                raise UserWarning(msg)
             else:
                 raise ValueError(msg)
         return realized_gains_losses
 
     def consume_short_lots_for_cover(self, cover_event: TradeEvent, is_historical_simulation: bool = False) -> List[RealizedGainLoss]:
         if cover_event.event_type != FinancialEventType.TRADE_BUY_SHORT_COVER: return []
-        if cover_event.quantity is None or cover_event.quantity <= Decimal(0): return [] 
+        if cover_event.quantity is None or cover_event.quantity <= Decimal(0): return []
         if cover_event.net_proceeds_or_cost_basis_eur is None: return []
 
-        quantity_to_realize = cover_event.quantity.quantize(global_config.PRECISION_QUANTITY, context=self.ctx) 
-        total_cost_for_cover_event = self.ctx.create_decimal(cover_event.net_proceeds_or_cost_basis_eur) 
+        quantity_to_realize = cover_event.quantity.quantize(global_config.PRECISION_QUANTITY, context=self.ctx)
+        total_cost_for_cover_event = self.ctx.create_decimal(cover_event.net_proceeds_or_cost_basis_eur)
 
         if quantity_to_realize == Decimal(0): return []
         cost_eur_per_unit_for_cover_event = self.ctx.divide(total_cost_for_cover_event, quantity_to_realize)
@@ -557,7 +519,7 @@ class FifoLedger:
             if not is_historical_simulation:
                 cost_basis_for_portion = self.ctx.multiply(quantity_covered_from_this_lot, cost_eur_per_unit_for_cover_event)
                 realization_value_for_portion = self.ctx.multiply(quantity_covered_from_this_lot, current_short_lot.unit_sale_proceeds_eur) # Renamed
-                gross_gain_loss = self.ctx.subtract(realization_value_for_portion, cost_basis_for_portion) 
+                gross_gain_loss = self.ctx.subtract(realization_value_for_portion, cost_basis_for_portion)
 
                 open_date_obj = parse_ibkr_date(current_short_lot.opening_date)
                 cover_date_obj = parse_ibkr_date(cover_event.event_date)
@@ -565,69 +527,22 @@ class FifoLedger:
                 if open_date_obj and cover_date_obj and cover_date_obj >= open_date_obj:
                     holding_period_days = (cover_date_obj - open_date_obj).days
 
-                tax_cat: Optional[TaxReportingCategory] = None
-                is_stillhalter_income_flag = False # Renamed
-                is_taxable_under_section_23_flag = True # Renamed
-
-                rgl_fund_type: Optional[InvestmentFundType] = None
-                rgl_tf_rate: Optional[Decimal] = None
-
-                if self.asset_category == AssetCategory.STOCK:
-                    tax_cat = TaxReportingCategory.ANLAGE_KAP_AKTIEN_GEWINN if gross_gain_loss >= Decimal(0) else TaxReportingCategory.ANLAGE_KAP_AKTIEN_VERLUST
-                elif self.asset_category == AssetCategory.BOND:
-                    tax_cat = TaxReportingCategory.ANLAGE_KAP_SONSTIGE_KAPITALERTRAEGE if gross_gain_loss >= Decimal(0) else TaxReportingCategory.ANLAGE_KAP_SONSTIGE_VERLUSTE
-                elif self.asset_category in [AssetCategory.OPTION, AssetCategory.CFD]:
-                    tax_cat = TaxReportingCategory.ANLAGE_KAP_TERMIN_GEWINN if gross_gain_loss >= Decimal(0) else TaxReportingCategory.ANLAGE_KAP_TERMIN_VERLUST
-                    if self.asset_category == AssetCategory.OPTION and gross_gain_loss >= Decimal(0):
-                        is_stillhalter_income_flag = True # Renamed
-                elif self.asset_category == AssetCategory.INVESTMENT_FUND:
-                    rgl_fund_type = self.fund_type
-                    if rgl_fund_type is None: 
-                        logger.error(f"CRITICAL: FifoLedger for Investment Fund {self.asset_internal_id} (Event: {cover_event.event_id}) has self.fund_type as None. Defaulting to InvestmentFundType.NONE for RGL.")
-                        rgl_fund_type = InvestmentFundType.NONE
-                    
-                    rgl_tf_rate = get_teilfreistellung_rate_for_fund_type(rgl_fund_type)
-                    
-                    if rgl_fund_type == InvestmentFundType.AKTIENFONDS:
-                        tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_AKTIENFONDS_GEWINN_GROSS
-                    elif rgl_fund_type == InvestmentFundType.MISCHFONDS:
-                        tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_MISCHFONDS_GEWINN_GROSS
-                    elif rgl_fund_type == InvestmentFundType.IMMOBILIENFONDS:
-                        tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_IMMOBILIENFONDS_GEWINN_GROSS
-                    elif rgl_fund_type == InvestmentFundType.AUSLANDS_IMMOBILIENFONDS:
-                        tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_AUSLANDS_IMMOBILIENFONDS_GEWINN_GROSS
-                    elif rgl_fund_type in [InvestmentFundType.SONSTIGE_FONDS, InvestmentFundType.NONE]:
-                        tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_SONSTIGE_FONDS_GEWINN_GROSS
-                    else: 
-                        logger.error(f"Unhandled fund type '{rgl_fund_type}' for KAP-INV tax category. Asset {self.asset_internal_id}, Event {cover_event.event_id}.")
-                        tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_SONSTIGE_FONDS_GEWINN_GROSS 
-
-                elif self.asset_category == AssetCategory.PRIVATE_SALE_ASSET: # Renamed
-                    if holding_period_days is not None and holding_period_days <= 365:
-                        is_taxable_under_section_23_flag = True # Renamed
-                        tax_cat = TaxReportingCategory.SECTION_23_ESTG_TAXABLE_GAIN if gross_gain_loss >= Decimal(0) else TaxReportingCategory.SECTION_23_ESTG_TAXABLE_LOSS
-                    else: 
-                        is_taxable_under_section_23_flag = False # Renamed
-                        tax_cat = TaxReportingCategory.SECTION_23_ESTG_EXEMPT_HOLDING_PERIOD_MET
-                
                 rgl = RealizedGainLoss(
                     originating_event_id=cover_event.event_id, asset_internal_id=self.asset_internal_id,
-                    asset_category_at_realization=self.asset_category, 
-                    acquisition_date=current_short_lot.opening_date, 
-                    realization_date=cover_event.event_date, 
+                    asset_category_at_realization=self.asset_category,
+                    acquisition_date=current_short_lot.opening_date,
+                    realization_date=cover_event.event_date,
                     realization_type=realization_type_for_rgl,
-                    quantity_realized=quantity_covered_from_this_lot, 
-                    unit_cost_basis_eur=cost_eur_per_unit_for_cover_event, # Renamed kwarg
-                    unit_realization_value_eur=current_short_lot.unit_sale_proceeds_eur, # Renamed kwarg
-                    total_cost_basis_eur=cost_basis_for_portion, # Renamed kwarg
+                    quantity_realized=quantity_covered_from_this_lot,
+                    unit_cost_basis_eur=cost_eur_per_unit_for_cover_event,
+                    unit_realization_value_eur=current_short_lot.unit_sale_proceeds_eur,
+                    total_cost_basis_eur=cost_basis_for_portion,
                     total_realization_value_eur=realization_value_for_portion,
                     gross_gain_loss_eur=gross_gain_loss, holding_period_days=holding_period_days,
-                    is_taxable_under_section_23=is_taxable_under_section_23_flag, # Renamed kwarg
-                    tax_reporting_category=tax_cat, 
-                    is_stillhalter_income=is_stillhalter_income_flag, # Renamed kwarg
-                    fund_type_at_sale=rgl_fund_type if self.asset_category == AssetCategory.INVESTMENT_FUND else None,
-                    teilfreistellung_rate_applied=rgl_tf_rate if self.asset_category == AssetCategory.INVESTMENT_FUND else None
+                    fund_type_at_sale=self.fund_type if self.asset_category == AssetCategory.INVESTMENT_FUND else None,
                 )
+                if self._tax_classifier is not None:
+                    self._tax_classifier(rgl)
                 realized_gains_losses.append(rgl)
 
         for i in sorted(short_lots_to_remove_indices, reverse=True): del self.short_lots[i]
@@ -636,11 +551,11 @@ class FifoLedger:
         if quantity_remaining_to_realize.copy_abs() > small_tolerance_qty:
             msg = (f"Insufficient short lots for cover event {cover_event.ibkr_transaction_id or cover_event.event_id} "
                    f"for asset {self.asset_internal_id}. Required to cover: {quantity_to_realize}, "
-                   f"Total available in short lots before this cover: {current_available_qty_in_short_lots}, " 
+                   f"Total available in short lots before this cover: {current_available_qty_in_short_lots}, "
                    f"Remaining to cover after processing lots: {quantity_remaining_to_realize}.")
             if is_historical_simulation:
                 logger.warning(f"Historical Simulation: {msg}")
-                raise UserWarning(msg) 
+                raise UserWarning(msg)
             else:
                 raise ValueError(msg)
         return realized_gains_losses
@@ -658,11 +573,11 @@ class FifoLedger:
             original_quantity = lot.quantity
             original_total_cost = lot.total_cost_basis_eur
             new_quantity = self.ctx.multiply(original_quantity, split_ratio).quantize(global_config.PRECISION_QUANTITY, context=self.ctx)
-            if new_quantity == Decimal(0) and original_quantity != Decimal(0) : 
+            if new_quantity == Decimal(0) and original_quantity != Decimal(0) :
                 logger.warning(f"Lot (Src: {lot.source_transaction_id}) quantity became zero after split ratio {split_ratio}. Original Qty: {original_quantity}. Setting cost/unit to 0.")
                 new_cost_per_unit = Decimal(0)
             elif new_quantity == Decimal(0) and original_quantity == Decimal(0) :
-                 new_cost_per_unit = Decimal(0) 
+                 new_cost_per_unit = Decimal(0)
             else:
                 new_cost_per_unit = self.ctx.divide(original_total_cost, new_quantity)
 
@@ -699,8 +614,8 @@ class FifoLedger:
         realized_gains_losses: List[RealizedGainLoss] = []
         realization_value_eur_per_unit_for_event = event.cash_per_share_eur
 
-        for current_lot in list(self.lots): 
-            quantity_from_this_lot = current_lot.quantity 
+        for current_lot in list(self.lots):
+            quantity_from_this_lot = current_lot.quantity
 
             cost_basis_for_portion = current_lot.total_cost_basis_eur
             realization_value_for_portion = self.ctx.multiply(quantity_from_this_lot, realization_value_eur_per_unit_for_event)
@@ -712,67 +627,21 @@ class FifoLedger:
             if acq_date_obj and real_date_obj and real_date_obj >= acq_date_obj :
                 holding_period_days = (real_date_obj - acq_date_obj).days
 
-            tax_cat: Optional[TaxReportingCategory] = None
-            is_stillhalter_income_flag = False # Renamed
-            is_taxable_under_section_23_flag = True # Renamed
-            
-            rgl_fund_type: Optional[InvestmentFundType] = None
-            rgl_tf_rate: Optional[Decimal] = None
-
-
-            if self.asset_category == AssetCategory.STOCK:
-                tax_cat = TaxReportingCategory.ANLAGE_KAP_AKTIEN_GEWINN if gross_gain_loss >= Decimal(0) else TaxReportingCategory.ANLAGE_KAP_AKTIEN_VERLUST
-            elif self.asset_category == AssetCategory.BOND:
-                 tax_cat = TaxReportingCategory.ANLAGE_KAP_SONSTIGE_KAPITALERTRAEGE if gross_gain_loss >= Decimal(0) else TaxReportingCategory.ANLAGE_KAP_SONSTIGE_VERLUSTE
-            elif self.asset_category in [AssetCategory.OPTION, AssetCategory.CFD]:
-                 tax_cat = TaxReportingCategory.ANLAGE_KAP_TERMIN_GEWINN if gross_gain_loss >= Decimal(0) else TaxReportingCategory.ANLAGE_KAP_TERMIN_VERLUST
-            elif self.asset_category == AssetCategory.INVESTMENT_FUND:
-                rgl_fund_type = self.fund_type
-                if rgl_fund_type is None:
-                    logger.error(f"CRITICAL: FifoLedger for Investment Fund {self.asset_internal_id} (Event: {event.event_id}) has self.fund_type as None. Defaulting to InvestmentFundType.NONE for RGL.")
-                    rgl_fund_type = InvestmentFundType.NONE
-                
-                rgl_tf_rate = get_teilfreistellung_rate_for_fund_type(rgl_fund_type)
-
-                if rgl_fund_type == InvestmentFundType.AKTIENFONDS:
-                    tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_AKTIENFONDS_GEWINN_GROSS
-                elif rgl_fund_type == InvestmentFundType.MISCHFONDS:
-                    tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_MISCHFONDS_GEWINN_GROSS
-                elif rgl_fund_type == InvestmentFundType.IMMOBILIENFONDS:
-                    tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_IMMOBILIENFONDS_GEWINN_GROSS
-                elif rgl_fund_type == InvestmentFundType.AUSLANDS_IMMOBILIENFONDS:
-                    tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_AUSLANDS_IMMOBILIENFONDS_GEWINN_GROSS
-                elif rgl_fund_type in [InvestmentFundType.SONSTIGE_FONDS, InvestmentFundType.NONE]:
-                    tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_SONSTIGE_FONDS_GEWINN_GROSS
-                else: 
-                    logger.error(f"Unhandled fund type '{rgl_fund_type}' for KAP-INV tax category. Asset {self.asset_internal_id}, Event {event.event_id}.")
-                    tax_cat = TaxReportingCategory.ANLAGE_KAP_INV_SONSTIGE_FONDS_GEWINN_GROSS
-
-            elif self.asset_category == AssetCategory.PRIVATE_SALE_ASSET: # Renamed
-                if holding_period_days is not None and holding_period_days <= 365:
-                    is_taxable_under_section_23_flag = True # Renamed
-                    tax_cat = TaxReportingCategory.SECTION_23_ESTG_TAXABLE_GAIN if gross_gain_loss >= Decimal(0) else TaxReportingCategory.SECTION_23_ESTG_TAXABLE_LOSS
-                else: 
-                    is_taxable_under_section_23_flag = False # Renamed
-                    tax_cat = TaxReportingCategory.SECTION_23_ESTG_EXEMPT_HOLDING_PERIOD_MET
-            
             rgl = RealizedGainLoss(
                 originating_event_id=event.event_id, asset_internal_id=self.asset_internal_id,
                 asset_category_at_realization=self.asset_category, acquisition_date=current_lot.acquisition_date,
                 realization_date=event.event_date,
-                realization_type=RealizationType.CASH_MERGER_PROCEEDS, # Renamed
+                realization_type=RealizationType.CASH_MERGER_PROCEEDS,
                 quantity_realized=quantity_from_this_lot,
-                unit_cost_basis_eur=current_lot.unit_cost_basis_eur, # Renamed kwarg
-                unit_realization_value_eur=realization_value_eur_per_unit_for_event, # Renamed kwarg
-                total_cost_basis_eur=cost_basis_for_portion, # Renamed kwarg
+                unit_cost_basis_eur=current_lot.unit_cost_basis_eur,
+                unit_realization_value_eur=realization_value_eur_per_unit_for_event,
+                total_cost_basis_eur=cost_basis_for_portion,
                 total_realization_value_eur=realization_value_for_portion,
                 gross_gain_loss_eur=gross_gain_loss, holding_period_days=holding_period_days,
-                is_taxable_under_section_23=is_taxable_under_section_23_flag, # Renamed kwarg
-                tax_reporting_category=tax_cat, 
-                is_stillhalter_income=is_stillhalter_income_flag, # Renamed kwarg
-                fund_type_at_sale=rgl_fund_type if self.asset_category == AssetCategory.INVESTMENT_FUND else None,
-                teilfreistellung_rate_applied=rgl_tf_rate if self.asset_category == AssetCategory.INVESTMENT_FUND else None
+                fund_type_at_sale=self.fund_type if self.asset_category == AssetCategory.INVESTMENT_FUND else None,
             )
+            if self._tax_classifier is not None:
+                self._tax_classifier(rgl)
             realized_gains_losses.append(rgl)
             logger.debug(f"  Generated RGL from cash merger for lot (Src: {current_lot.source_transaction_id}): Realized {quantity_from_this_lot}, Gross G/L={gross_gain_loss}")
 
@@ -790,17 +659,17 @@ class FifoLedger:
 
         if self.asset_category == AssetCategory.OPTION:
             logger.warning(f"Stock dividend event {event.event_id} received for OPTION asset {self.asset_internal_id}. This is unusual. Treating quantity as contracts with FMV per contract if applicable, but verify CA terms.")
-        elif self.asset_category != AssetCategory.STOCK and self.asset_category != AssetCategory.INVESTMENT_FUND : 
+        elif self.asset_category != AssetCategory.STOCK and self.asset_category != AssetCategory.INVESTMENT_FUND :
             logger.warning(f"Stock dividend event {event.event_id} received for non-STOCK/non-FUND asset {self.asset_internal_id} (Category: {self.asset_category.name}). Adding lot based on shares/FMV, but verify asset classification and CA terms.")
 
         new_lot_quantity = event.quantity_new_shares_received.quantize(global_config.PRECISION_QUANTITY, context=self.ctx)
-        new_lot_cost_per_unit = event.fmv_per_new_share_eur 
+        new_lot_cost_per_unit = event.fmv_per_new_share_eur
         new_lot_total_cost = self.ctx.multiply(new_lot_quantity, new_lot_cost_per_unit)
 
         source_id = event.ca_action_id_ibkr or event.ibkr_transaction_id or f"STOCKDIV_{event.event_id}"
 
         new_lot = FifoLot(
-            acquisition_date=event.event_date, quantity=new_lot_quantity, 
+            acquisition_date=event.event_date, quantity=new_lot_quantity,
             unit_cost_basis_eur=new_lot_cost_per_unit, # Renamed
             total_cost_basis_eur=new_lot_total_cost, source_transaction_id=source_id
         )
@@ -819,7 +688,7 @@ class FifoLedger:
         qty_to_consume = quantity_contracts_to_consume.quantize(global_config.PRECISION_QUANTITY, context=self.ctx)
         if qty_to_consume <= Decimal(0):
             logger.warning(f"Quantity to consume for long option cost must be positive. Got {qty_to_consume}. Asset ID: {self.asset_internal_id}. Returning empty list.")
-            return [] 
+            return []
 
         consumed_lot_details: List[ConsumedLotDetail] = []
         quantity_remaining_to_consume = qty_to_consume
@@ -854,9 +723,9 @@ class FifoLedger:
             logger.debug(f"  Removing fully consumed long option lot index {i} (Src: {self.lots[i].source_transaction_id})")
             del self.lots[i]
 
-        small_tolerance_qty = Decimal('1e-10') 
-        if quantity_remaining_to_consume.copy_abs() > small_tolerance_qty: 
-            current_total_qty_in_lots = sum(l.quantity for l in self.lots) 
+        small_tolerance_qty = Decimal('1e-10')
+        if quantity_remaining_to_consume.copy_abs() > small_tolerance_qty:
+            current_total_qty_in_lots = sum(l.quantity for l in self.lots)
             available_before_this_op = current_total_qty_in_lots + (qty_to_consume - quantity_remaining_to_consume)
             raise ValueError(f"Insufficient long option contracts for asset {self.asset_internal_id}. "
                              f"Required to consume: {qty_to_consume}, "
@@ -910,13 +779,13 @@ class FifoLedger:
             del self.short_lots[i]
 
         small_tolerance_qty = Decimal('1e-10')
-        if quantity_remaining_to_consume.copy_abs() > small_tolerance_qty: 
+        if quantity_remaining_to_consume.copy_abs() > small_tolerance_qty:
             current_total_qty_in_lots = sum(sl.quantity_shorted for sl in self.short_lots)
             available_before_this_op = current_total_qty_in_lots + (qty_to_consume - quantity_remaining_to_consume)
             raise ValueError(f"Insufficient short option contracts for asset {self.asset_internal_id}. "
                              f"Required to consume: {qty_to_consume}, "
-                             f"Total available before this consumption: {available_before_this_op}, " 
-                             f"Remaining to consume: {quantity_remaining_to_consume}.") 
+                             f"Total available before this consumption: {available_before_this_op}, "
+                             f"Remaining to consume: {quantity_remaining_to_consume}.")
 
         logger.debug(f"Successfully consumed {qty_to_consume - quantity_remaining_to_consume} short option contracts. Details: {consumed_lot_details}")
         return consumed_lot_details
@@ -936,16 +805,16 @@ class FifoLedger:
         """
         if repayment_amount_eur <= Decimal('0') or not self.lots:
             return repayment_amount_eur
-            
+
         remaining_repayment = repayment_amount_eur
-        
+
         for lot in self.lots:
             if remaining_repayment <= Decimal('0'):
                 break
-                
+
             reduction = min(remaining_repayment, lot.total_cost_basis_eur)
             lot.total_cost_basis_eur = self.ctx.subtract(lot.total_cost_basis_eur, reduction)
             lot.unit_cost_basis_eur = self.ctx.divide(lot.total_cost_basis_eur, lot.quantity) if lot.quantity > Decimal('0') else Decimal('0')
             remaining_repayment = self.ctx.subtract(remaining_repayment, reduction)
-        
+
         return remaining_repayment  # Excess that becomes taxable income

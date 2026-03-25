@@ -1,0 +1,176 @@
+# src/countries/cz/tax_items.py
+"""
+Czech tax item model — the atomic unit of the CZ tax result.
+
+Every tax-relevant economic fact (dividend, interest payment, security
+disposal, option close/expiry) becomes one ``CzTaxItem``.  Each item
+carries:
+
+- **bucket** — which CZ tax section it belongs to (§8 or §10),
+- **source identifiers** — event IDs, asset info, dates,
+- **original amounts** — in the transaction currency,
+- **CZK amounts** — converted per-event via the CZ FX policy,
+- **FX metadata** — full ``FxConversionRecord`` audit trail,
+- **withholding tax link** — for income items that have associated WHT.
+
+The model is designed to be trivially serialisable to JSON / XLSX
+and to support later additions (time test, WHT credit calculation)
+without structural changes.
+"""
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from decimal import Decimal
+from enum import Enum, auto
+from typing import Any, Dict, List, Optional
+
+from src.countries.cz.enums import CzTaxSection
+from src.countries.cz.fx_policy import FxConversionRecord
+
+
+# ---------------------------------------------------------------------------
+# Item type — distinguishes the economic nature of the item
+# ---------------------------------------------------------------------------
+
+class CzTaxItemType(Enum):
+    """What kind of economic event produced this tax item."""
+    DIVIDEND = auto()
+    FUND_DISTRIBUTION = auto()
+    INTEREST = auto()
+    SECURITY_DISPOSAL = auto()     # Stock, bond, ETF/fund sale
+    OPTION_CLOSE = auto()          # Option traded to close (buy-to-close / sell-to-close)
+    OPTION_EXPIRY_WORTHLESS = auto()
+    OPTION_EXERCISE_ASSIGNMENT = auto()  # Realized outcome from exercise/assignment
+    OTHER = auto()
+
+
+# ---------------------------------------------------------------------------
+# Withholding-tax record linked to a parent income item
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CzWhtRecord:
+    """Withholding tax linked to a parent income item (dividend / interest)."""
+    wht_event_id: uuid.UUID
+    event_date: str                        # YYYY-MM-DD
+    original_amount: Decimal               # positive, in original currency
+    original_currency: str
+    amount_czk: Optional[Decimal] = None   # converted via FX policy
+    fx: Optional[FxConversionRecord] = None
+    source_country: Optional[str] = None   # ISO country code (e.g. "US")
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "wht_event_id": str(self.wht_event_id),
+            "event_date": self.event_date,
+            "original_amount": str(self.original_amount),
+            "original_currency": self.original_currency,
+            "amount_czk": str(self.amount_czk) if self.amount_czk is not None else None,
+            "source_country": self.source_country,
+        }
+        if self.fx is not None:
+            d["fx_rate"] = str(self.fx.fx_rate_inverse)
+            d["fx_date_used"] = self.fx.fx_date_used
+        return d
+
+
+# ---------------------------------------------------------------------------
+# CzTaxItem — the main model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CzTaxItem:
+    """
+    One atomic Czech tax item.
+
+    Designed for easy JSON/XLSX export and downstream processing
+    (time test, WHT credit, form-line mapping).
+    """
+
+    # --- Classification ---
+    item_type: CzTaxItemType
+    section: CzTaxSection
+
+    # --- Source identification ---
+    source_event_id: uuid.UUID           # originating event or RGL event ID
+    asset_id: Optional[uuid.UUID] = None
+    asset_symbol: Optional[str] = None
+    asset_isin: Optional[str] = None
+    asset_description: Optional[str] = None
+    asset_category: Optional[str] = None  # e.g. "STOCK", "OPTION"
+
+    # --- Dates ---
+    event_date: str = ""                  # primary date (trade / payment date)
+    acquisition_date: Optional[str] = None  # for disposals: lot acquisition date
+    holding_period_days: Optional[int] = None
+
+    # --- Original amounts (transaction currency) ---
+    original_amount: Optional[Decimal] = None
+    original_currency: Optional[str] = None
+
+    # --- EUR amounts (from core pipeline) ---
+    amount_eur: Optional[Decimal] = None
+
+    # --- CZK amounts (per-event converted) ---
+    amount_czk: Optional[Decimal] = None
+
+    # --- For disposals: cost basis and proceeds ---
+    cost_basis_eur: Optional[Decimal] = None
+    proceeds_eur: Optional[Decimal] = None
+    gain_loss_eur: Optional[Decimal] = None
+    cost_basis_czk: Optional[Decimal] = None
+    proceeds_czk: Optional[Decimal] = None
+    gain_loss_czk: Optional[Decimal] = None
+
+    # --- FX audit ---
+    fx: Optional[FxConversionRecord] = None
+    fx_cost_basis: Optional[FxConversionRecord] = None
+    fx_proceeds: Optional[FxConversionRecord] = None
+
+    # --- Withholding tax link ---
+    wht_records: List[CzWhtRecord] = field(default_factory=list)
+
+    # --- Quantity (for disposals) ---
+    quantity: Optional[Decimal] = None
+
+    def total_wht_czk(self) -> Decimal:
+        """Sum of all linked WHT amounts in CZK."""
+        return sum(
+            (r.amount_czk for r in self.wht_records if r.amount_czk is not None),
+            Decimal(0),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Flat dict suitable for JSON / XLSX export."""
+        d: Dict[str, Any] = {
+            "item_type": self.item_type.name,
+            "section": self.section.name,
+            "source_event_id": str(self.source_event_id),
+            "asset_symbol": self.asset_symbol,
+            "asset_isin": self.asset_isin,
+            "asset_description": self.asset_description,
+            "asset_category": self.asset_category,
+            "event_date": self.event_date,
+            "acquisition_date": self.acquisition_date,
+            "holding_period_days": self.holding_period_days,
+            "original_amount": str(self.original_amount) if self.original_amount is not None else None,
+            "original_currency": self.original_currency,
+            "amount_eur": str(self.amount_eur) if self.amount_eur is not None else None,
+            "amount_czk": str(self.amount_czk) if self.amount_czk is not None else None,
+            "cost_basis_eur": str(self.cost_basis_eur) if self.cost_basis_eur is not None else None,
+            "proceeds_eur": str(self.proceeds_eur) if self.proceeds_eur is not None else None,
+            "gain_loss_eur": str(self.gain_loss_eur) if self.gain_loss_eur is not None else None,
+            "cost_basis_czk": str(self.cost_basis_czk) if self.cost_basis_czk is not None else None,
+            "proceeds_czk": str(self.proceeds_czk) if self.proceeds_czk is not None else None,
+            "gain_loss_czk": str(self.gain_loss_czk) if self.gain_loss_czk is not None else None,
+            "quantity": str(self.quantity) if self.quantity is not None else None,
+            "wht_total_czk": str(self.total_wht_czk()),
+            "wht_records": [r.to_dict() for r in self.wht_records],
+        }
+        if self.fx is not None:
+            d["fx_source"] = self.fx.fx_source
+            d["fx_policy"] = self.fx.fx_policy
+            d["fx_rate"] = str(self.fx.fx_rate_inverse)
+            d["fx_date_used"] = self.fx.fx_date_used
+        return d

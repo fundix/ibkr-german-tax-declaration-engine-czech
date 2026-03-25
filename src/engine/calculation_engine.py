@@ -9,14 +9,14 @@ from datetime import datetime, date
 from src.domain.events import (
     FinancialEvent, TradeEvent, CorpActionSplitForward, CorpActionMergerCash,
     CorpActionStockDividend, CorpActionMergerStock, CorporateActionEvent,
-    CorpActionExpireDividendRights, OptionExerciseEvent, OptionAssignmentEvent, 
-    OptionExpirationWorthlessEvent, OptionLifecycleEvent, CashFlowEvent, FeeEvent, 
+    CorpActionExpireDividendRights, OptionExerciseEvent, OptionAssignmentEvent,
+    OptionExpirationWorthlessEvent, OptionLifecycleEvent, CashFlowEvent, FeeEvent,
     WithholdingTaxEvent, CurrencyConversionEvent
 )
 from src.domain.assets import Asset, Stock, Bond, AssetCategory, Option, InvestmentFund
 from src.identification.asset_resolver import AssetResolver
 from src.domain.results import RealizedGainLoss, VorabpauschaleData
-from src.domain.enums import FinancialEventType, InvestmentFundType 
+from src.domain.enums import FinancialEventType, InvestmentFundType
 from src.utils.sorting_utils import get_event_sort_key
 from src.utils.type_utils import parse_ibkr_date
 
@@ -54,8 +54,9 @@ def run_main_calculations(
     exchange_rate_provider: ECBExchangeRateProvider,
     tax_year: int,
     internal_calculation_precision: int, # Renamed from internal_working_precision
-    decimal_rounding_mode: str
-) -> Tuple[List[RealizedGainLoss], List[VorabpauschaleData], List[FinancialEvent], int]: 
+    decimal_rounding_mode: str,
+    tax_classifier: Optional[Any] = None,
+) -> Tuple[List[RealizedGainLoss], List[VorabpauschaleData], List[FinancialEvent], int]:
     """
     Runs the main calculation logic:
     1. Separates historical and current year events.
@@ -80,33 +81,33 @@ def run_main_calculations(
     tax_year_end_date_str = f"{tax_year}-12-31"
     tax_year_start_date_obj = parse_ibkr_date(tax_year_start_date_str)
     tax_year_end_date_obj = parse_ibkr_date(tax_year_end_date_str)
-    
+
     if not tax_year_start_date_obj:
         logger.error(f"Could not parse tax year start date: {tax_year_start_date_str}. Aborting calculations.")
-        return [], [], financial_events, 0 
+        return [], [], financial_events, 0
     if not tax_year_end_date_obj:
         logger.error(f"Could not parse tax year end date: {tax_year_end_date_str}. Aborting calculations.")
-        return [], [], financial_events, 0 
+        return [], [], financial_events, 0
 
     logger.info("Separating historical and current year events...")
     filtered_events_count = 0
     for event in financial_events:
         try:
             event_sort_key = get_event_sort_key(event, asset_resolver)
-            event_date_obj = event_sort_key[0] 
+            event_date_obj = event_sort_key[0]
         except ValueError as e:
             logger.error(f"Event {event.event_id} has invalid date or identifier ({e}). Cannot process.")
-            continue 
+            continue
 
         if event_date_obj < tax_year_start_date_obj:
-            if isinstance(event, (TradeEvent, CorpActionSplitForward, CorpActionStockDividend)): 
+            if isinstance(event, (TradeEvent, CorpActionSplitForward, CorpActionStockDividend)):
                 historical_events_by_asset[event.asset_internal_id].append(event)
         elif event_date_obj <= tax_year_end_date_obj:
             current_year_events.append(event)
         else:
             filtered_events_count += 1
             logger.debug(f"Filtered out event {event.event_id} with date {event_date_obj} (after tax year {tax_year})")
-    
+
     if filtered_events_count > 0:
         logger.info(f"Filtered out {filtered_events_count} events occurring after tax year {tax_year}")
 
@@ -125,16 +126,17 @@ def run_main_calculations(
                 asset_multiplier_val = asset_obj.multiplier
             elif isinstance(asset_obj, InvestmentFund):
                 asset_fund_type = asset_obj.fund_type
-            
+
             ledger = FifoLedger(
                 asset_internal_id=asset_id, asset_category=asset_obj.asset_category,
                 asset_multiplier_from_asset=asset_multiplier_val,
                 currency_converter=currency_converter, exchange_rate_provider=exchange_rate_provider,
                 internal_working_precision=internal_calculation_precision, # Pass renamed variable
                 decimal_rounding_mode=decimal_rounding_mode,
-                fund_type=asset_fund_type 
+                fund_type=asset_fund_type,
+                tax_classifier=tax_classifier,
             )
-            
+
             asset_historical_events_for_soy_init = []
             if asset_id in historical_events_by_asset:
                 try:
@@ -149,12 +151,12 @@ def run_main_calculations(
             try:
                 ledger.initialize_lots_from_soy(
                     asset=asset_obj,
-                    all_historical_events_for_asset=asset_historical_events_for_soy_init, 
+                    all_historical_events_for_asset=asset_historical_events_for_soy_init,
                     tax_year=tax_year
                 )
             except ValueError as e:
                 logger.critical(f"Fatal error initializing FIFO lots from SOY for asset {asset_obj.get_classification_key()} (ID: {asset_id}): {e}. Aborting.")
-                raise e 
+                raise e
 
             fifo_ledgers[asset_id] = ledger
 
@@ -215,7 +217,8 @@ def run_main_calculations(
                 context: Dict[str, Any] = {
                     'asset_resolver': asset_resolver,
                     'pending_option_adjustments': pending_option_adjustments,
-                    'currency_converter': currency_converter 
+                    'currency_converter': currency_converter,
+                    'tax_classifier': tax_classifier,
                 }
                 logger.debug(f"Dispatching event {event.event_id} ({event.event_type.name}) to {type(processor).__name__}")
 
@@ -247,10 +250,10 @@ def run_main_calculations(
                 excess = ledger.reduce_cost_basis_for_capital_repayment(repayment_amount_eur)
                 if excess > Decimal('0'):
                     logger.info(f"Capital repayment excess {excess} EUR becomes taxable dividend income")
-                    
+
                     # Create new DIVIDEND_CASH event for excess amount
                     _create_excess_dividend_event(event, excess, asset_object, current_year_events)
-                    
+
                     # Reduce original capital repayment event to only the cost basis portion
                     cost_basis_portion = repayment_amount_eur - excess
                     event.gross_amount_eur = cost_basis_portion
@@ -275,7 +278,7 @@ def run_main_calculations(
 
 
     logger.info("Performing End-of-Year (EOY) quantity validation...")
-    eoy_mismatch_errors = 0 
+    eoy_mismatch_errors = 0
     for asset_id, asset_obj in asset_resolver.assets_by_internal_id.items():
         if asset_obj.asset_category == AssetCategory.CASH_BALANCE:
             continue
@@ -306,12 +309,12 @@ def run_main_calculations(
                     f"Difference: {calculated_eoy_qty - reported_eoy_qty}"
                 )
                 eoy_mismatch_errors += 1
-        elif abs(calculated_eoy_qty) > comparison_tolerance: 
-            logger.error( 
+        elif abs(calculated_eoy_qty) > comparison_tolerance:
+            logger.error(
                 f"EOY MISMATCH for {asset_obj.description or asset_obj.get_classification_key()} (ID: {asset_id}): "
                 f"Calculated EOY Qty: {calculated_eoy_qty}, but asset NOT found in EOY positions report (implying reported EOY Qty is 0)."
             )
-            eoy_mismatch_errors += 1 
+            eoy_mismatch_errors += 1
 
     if eoy_mismatch_errors > 0:
         logger.error(f"EOY Quantity Validation FAILED with {eoy_mismatch_errors} critical mismatches. Processing will continue, but results may be inaccurate.")
@@ -330,7 +333,7 @@ def run_main_calculations(
 
 def _create_excess_dividend_event(original_event, excess_amount, asset_object, current_year_events):
     """Create a new DIVIDEND_CASH event for excess capital repayment amount.
-    
+
     Args:
         original_event: The original CAPITAL_REPAYMENT event
         excess_amount: The excess amount that becomes taxable dividend
@@ -339,7 +342,7 @@ def _create_excess_dividend_event(original_event, excess_amount, asset_object, c
     """
     from src.domain.events import CashFlowEvent
     from src.domain.enums import FinancialEventType
-    
+
     # Create new DIVIDEND_CASH event for excess amount
     excess_dividend_event = CashFlowEvent(
         asset_internal_id=asset_object.internal_asset_id,
@@ -352,14 +355,14 @@ def _create_excess_dividend_event(original_event, excess_amount, asset_object, c
         ibkr_activity_description=f"{original_event.ibkr_activity_description} [EXCESS TAXABLE DIVIDEND]",
         ibkr_notes_codes=getattr(original_event, 'ibkr_notes_codes', None)
     )
-    
-    # Set the EUR amount 
+
+    # Set the EUR amount
     excess_dividend_event.gross_amount_eur = excess_amount
     excess_dividend_event.event_id = uuid.uuid4()
-    
+
     # Add to the current year events list for processing
     current_year_events.append(excess_dividend_event)
-    
+
     logger.info(f"Created excess dividend event {excess_dividend_event.event_id} for {excess_amount} EUR from capital repayment excess")
-    
+
     return excess_dividend_event

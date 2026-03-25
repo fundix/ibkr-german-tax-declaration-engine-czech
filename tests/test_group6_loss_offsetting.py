@@ -27,7 +27,10 @@ from src.identification.asset_resolver import AssetResolver
 from src.classification.asset_classifier import AssetClassifier
 from src.domain.assets import Asset, InvestmentFund
 from src.domain.events import FinancialEvent
+from src.countries.de.plugin import GermanTaxClassifier
 import src.config as global_config
+
+_de_classifier = GermanTaxClassifier()
 
 # Fixtures imports
 from tests.fixtures.loss_offsetting_data import (
@@ -116,11 +119,13 @@ def create_mock_rgl(
 
     if asset_category == AssetCategory.INVESTMENT_FUND:
         rgl.fund_type_at_sale = fund_type
-        rgl.__post_init__()
 
     if asset_category == AssetCategory.PRIVATE_SALE_ASSET:
-        rgl.is_taxable_under_section_23 = is_taxable_p23
-        rgl.__post_init__()
+        # Set holding_period_days so classifier can determine §23 taxability
+        rgl.holding_period_days = 100 if is_taxable_p23 else 400
+
+    # Use GermanTaxClassifier to populate DE-specific fields
+    _de_classifier.classify(rgl)
 
     return rgl
 

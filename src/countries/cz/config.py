@@ -1,0 +1,57 @@
+# src/countries/cz/config.py
+"""
+Czech Republic country-specific configuration model.
+
+Defines CZ-specific settings that are independent of the global
+application config (file paths, precision, etc.).
+
+PLACEHOLDER: Values here are reasonable defaults but need validation
+against current Czech tax legislation before production use.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import Dict, Optional
+
+from src.countries.cz.fx_policy import CzFxPolicyConfig
+
+
+@dataclass
+class CzTaxConfig:
+    """Configuration for the Czech tax plugin."""
+
+    # --- Currency ---
+    home_currency: str = "CZK"
+
+    # --- FX policy ---
+    fx_policy: CzFxPolicyConfig = field(default_factory=CzFxPolicyConfig)
+
+    # --- Tax rates (§36 ZDP) ---
+    # PLACEHOLDER: 15 % base rate; 23 % above CZK 1 935 552 (2024).
+    # For IBKR income this is almost always 15 %.
+    base_tax_rate: Decimal = Decimal("0.15")
+    elevated_tax_rate: Decimal = Decimal("0.23")
+    elevated_rate_threshold_czk: Decimal = Decimal("1935552")
+
+    # --- Holding-period test (§4/1/w ZDP) ---
+    # Securities acquired after 2014-01-01: exempt if held > 3 years.
+    holding_test_years: int = 3
+    # PLACEHOLDER: CZK 100 000 annual limit on exempt disposals
+    # introduced by 2025 amendment; set to 0 to disable.
+    annual_exempt_limit_czk: Decimal = Decimal("0")
+
+    # --- Withholding tax credit (§38f ZDP) ---
+    # Method: proportional credit (zápočet daně).
+    max_wht_credit_rate: Decimal = Decimal("0.15")
+
+    # --- CNB cache path ---
+    cnb_cache_file_path: str = "cache/cnb_exchange_rates.json"
+
+    # --- Income bucket labels (for TaxResult sections) ---
+    section_labels: Dict[str, str] = field(default_factory=lambda: {
+        "cz_8_dividends":  "§8 ZDP – Dividendy",
+        "cz_8_interest":   "§8 ZDP – Úroky",
+        "cz_10_securities": "§10 ZDP – Cenné papíry",
+        "cz_10_options":   "§10 ZDP – Opce a deriváty",
+    })

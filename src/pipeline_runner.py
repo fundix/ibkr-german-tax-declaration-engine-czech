@@ -19,6 +19,7 @@ from src.utils.currency_converter import CurrencyConverter
 from src.utils.exchange_rate_provider import ECBExchangeRateProvider, ExchangeRateProvider # Added base for custom provider
 from src.engine.calculation_engine import run_main_calculations
 from src.identification.asset_resolver import AssetResolver
+from src.countries.registry import get_tax_plugin
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,8 @@ def run_core_processing_pipeline(
     corporate_actions_file_path: str,
     interactive_classification_mode: bool,
     tax_year_to_process: int = config.TAX_YEAR, # Allow override for testing
-    custom_rate_provider: Optional[ExchangeRateProvider] = None # For testing ECB mock
+    custom_rate_provider: Optional[ExchangeRateProvider] = None, # For testing ECB mock
+    country_code: str = "de",
 ) -> ProcessingOutput:
     """
     Runs the core data processing pipeline: parsing, enrichment, and calculations.
@@ -119,6 +121,9 @@ def run_core_processing_pipeline(
     eoy_mismatch_error_count_calc = 0
     try:
         # Ensure run_main_calculations uses the passed tax_year_to_process
+        _tax_plugin = get_tax_plugin(country_code)
+        _tax_classifier = _tax_plugin.get_tax_classifier()
+        logger.info(f"Using tax classifier for country: {country_code}")
         realized_gains_losses, vorabpauschale_items, processed_income_events, eoy_mismatch_error_count_calc = run_main_calculations(
             financial_events=financial_events_enriched,
             asset_resolver=orchestrator.asset_resolver, # Use the resolver from the orchestrator
@@ -126,7 +131,8 @@ def run_core_processing_pipeline(
             exchange_rate_provider=rate_provider,
             tax_year=tax_year_to_process,
             internal_calculation_precision=config.INTERNAL_CALCULATION_PRECISION, # Renamed parameter
-            decimal_rounding_mode=config.DECIMAL_ROUNDING_MODE
+            decimal_rounding_mode=config.DECIMAL_ROUNDING_MODE,
+            tax_classifier=_tax_classifier.classify,
         )
     except Exception as e:
         logger.critical(f"Calculation engine failed with unexpected error: {e}", exc_info=True)
