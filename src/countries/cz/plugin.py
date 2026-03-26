@@ -32,7 +32,10 @@ from src.countries.cz.fx_policy import (
     CzFxPolicyConfig,
     FxConversionRecord,
 )
+from src.countries.cz.annual_limit import evaluate_annual_limit
+from src.countries.cz.foreign_tax_credit import CzForeignTaxCreditSummary, evaluate_foreign_tax_credit
 from src.countries.cz.item_builder import build_tax_items
+from src.countries.cz.loss_offsetting import CzLossOffsettingResult, compute_loss_offsetting
 from src.countries.cz.tax_items import CzTaxItem, CzTaxItemType, CzTaxReviewStatus, CzWhtRecord
 from src.countries.cz.time_test import evaluate_time_test
 from src.domain.assets import Asset
@@ -118,7 +121,7 @@ class CzechTaxAggregator:
         TWO = Decimal("0.01")
         ZERO = Decimal(0)
 
-        # --- Build individual tax items with FX + WHT linking ---
+        # --- Phase 1: Build individual tax items with FX + WHT linking ---
         items, fx_records = build_tax_items(
             realized_gains_losses=realized_gains_losses,
             financial_events=financial_events,
@@ -126,87 +129,53 @@ class CzechTaxAggregator:
             fx=self._fx,
         )
 
-        # --- Apply time test (sets taxability fields in-place) ---
+        # --- Phase 2: Apply time test (sets taxability fields in-place) ---
         evaluate_time_test(items, self.config)
 
-        # --- Determine amount field: CZK if converter available, else EUR ---
+        # --- Phase 3: Apply annual exempt limit (after time test) ---
+        annual_limit_proceeds = evaluate_annual_limit(items, self.config)
+
+        # --- Phase 4: Compute §10 loss offsetting ---
         has_fx = self._fx is not None
+        netting = compute_loss_offsetting(items, has_fx)
+        netting.annual_limit_eligible_proceeds = annual_limit_proceeds
+        netting.annual_limit_threshold = self.config.annual_exempt_limit_czk
+        netting.annual_limit_applied = (
+            self.config.annual_exempt_limit_enabled
+            and annual_limit_proceeds <= self.config.annual_exempt_limit_czk
+            and annual_limit_proceeds > ZERO
+        )
 
-        def _gl(it: CzTaxItem) -> Decimal:
-            return (it.gain_loss_czk if has_fx else it.gain_loss_eur) or ZERO
-
-        def _amt(it: CzTaxItem) -> Decimal:
-            return (it.amount_czk if has_fx else it.amount_eur) or ZERO
-
-        # --- Aggregate by section, split by taxability ---
-        # §8 dividends
+        # --- Phase 5: Aggregate §8 income (dividends, interest) ---
         div_taxable = ZERO
-        div_exempt = ZERO
-        div_pending = ZERO
         div_wht = ZERO
-        div_count = div_exempt_count = div_pending_count = 0
-
-        # §8 interest
+        div_count = 0
         int_taxable = ZERO
         int_count = 0
 
-        # §10 securities
-        sec_taxable_gains = ZERO
-        sec_taxable_losses = ZERO
-        sec_exempt_total = ZERO
-        sec_pending_total = ZERO
-        sec_total = sec_exempt_count = sec_pending_count = 0
-
-        # §10 options
-        opt_taxable_gains = ZERO
-        opt_taxable_losses = ZERO
-        opt_total = 0
-
         for it in items:
             if it.section == CzTaxSection.CZ_8_DIVIDENDS:
-                amt = _amt(it)
-                div_count += 1
-                if it.included_in_tax_base:
-                    div_taxable += amt
+                if it.item_type == CzTaxItemType.OTHER:
+                    # Unlinked WHT standalone item — count WHT only, not as income
                     div_wht += it.total_wht_czk() if has_fx else sum(
                         (r.original_amount for r in it.wht_records), ZERO
                     )
-                # Dividends are always taxable — no exempt/pending split needed
-
+                    continue
+                div_count += 1
+                if it.included_in_tax_base:
+                    div_taxable += (it.amount_czk if has_fx else it.amount_eur) or ZERO
+                    div_wht += it.total_wht_czk() if has_fx else sum(
+                        (r.original_amount for r in it.wht_records), ZERO
+                    )
             elif it.section == CzTaxSection.CZ_8_INTEREST:
                 int_count += 1
                 if it.included_in_tax_base:
-                    int_taxable += _amt(it)
-
-            elif it.section == CzTaxSection.CZ_10_SECURITIES:
-                gl = _gl(it)
-                sec_total += 1
-                if it.tax_review_status == CzTaxReviewStatus.PENDING_MANUAL_REVIEW:
-                    sec_pending_count += 1
-                    sec_pending_total += gl.copy_abs()
-                elif it.is_exempt:
-                    sec_exempt_count += 1
-                    sec_exempt_total += gl.copy_abs()
-                # Only included_in_tax_base items go into taxable gains/losses
-                if it.included_in_tax_base:
-                    if gl >= ZERO:
-                        sec_taxable_gains += gl
-                    else:
-                        sec_taxable_losses += gl.copy_abs()
-
-            elif it.section == CzTaxSection.CZ_10_OPTIONS:
-                gl = _gl(it)
-                opt_total += 1
-                if it.included_in_tax_base:
-                    if gl >= ZERO:
-                        opt_taxable_gains += gl
-                    else:
-                        opt_taxable_losses += gl.copy_abs()
+                    int_taxable += (it.amount_czk if has_fx else it.amount_eur) or ZERO
 
         cur = "CZK" if has_fx else "EUR"
         c = cur.lower()
 
-        # --- Build TaxResult sections ---
+        # --- Phase 6: Build TaxResult sections ---
         sections: Dict[str, TaxResultSection] = {}
 
         sections["cz_8_dividends"] = TaxResultSection(
@@ -230,32 +199,28 @@ class CzechTaxAggregator:
             notes=([] if has_fx else ["no FX converter — amounts in EUR"]),
         )
 
-        sections["cz_10_securities"] = TaxResultSection(
-            section_key="cz_10_securities",
-            label=self.config.section_labels.get("cz_10_securities", "§10 – Cenné papíry"),
-            line_items={
-                f"taxable_gains_{c}": sec_taxable_gains.quantize(TWO),
-                f"deductible_losses_{c}": sec_taxable_losses.quantize(TWO),
-                f"net_taxable_{c}": (sec_taxable_gains - sec_taxable_losses).quantize(TWO),
-                f"exempt_total_{c}": sec_exempt_total.quantize(TWO),
-                f"pending_review_{c}": sec_pending_total.quantize(TWO),
-                "item_count_total": Decimal(sec_total),
-                "item_count_exempt": Decimal(sec_exempt_count),
-                "item_count_pending": Decimal(sec_pending_count),
-            },
+        # --- Phase 5.5: Foreign tax credit (§38f ZDP) ---
+        ftc_summary = evaluate_foreign_tax_credit(items, self.config, has_fx)
+
+        # §10 netting summary (from loss_offsetting module)
+        netting_items = netting.to_line_items(cur)
+        sections["cz_10_summary"] = TaxResultSection(
+            section_key="cz_10_summary",
+            label="§10 ZDP – Souhrnný přehled",
+            line_items=netting_items,
             notes=["PLACEHOLDER: expense deduction rules (§10/4 ZDP) not applied"],
         )
 
-        sections["cz_10_options"] = TaxResultSection(
-            section_key="cz_10_options",
-            label=self.config.section_labels.get("cz_10_options", "§10 – Opce a deriváty"),
-            line_items={
-                f"taxable_gains_{c}": opt_taxable_gains.quantize(TWO),
-                f"deductible_losses_{c}": opt_taxable_losses.quantize(TWO),
-                f"net_taxable_{c}": (opt_taxable_gains - opt_taxable_losses).quantize(TWO),
-                "item_count": Decimal(opt_total),
-            },
-            notes=[],
+        # Foreign tax credit summary
+        ftc_items = ftc_summary.to_line_items(cur)
+        sections["cz_ftc_summary"] = TaxResultSection(
+            section_key="cz_ftc_summary",
+            label="§38f ZDP – Zápočet zahraniční daně (preliminary)",
+            line_items=ftc_items,
+            notes=[
+                "PRELIMINARY: per-item credit cap only; "
+                "final §38f credit depends on total CZ tax liability (not yet computed)"
+            ],
         )
 
         return TaxResult(
@@ -264,6 +229,8 @@ class CzechTaxAggregator:
             sections=sections,
             country_result={
                 "items": items,
+                "netting": netting,
+                "ftc_summary": ftc_summary,
                 "fx_conversion_records": fx_records,
                 "fx_policy": self.config.fx_policy,
                 "currency": cur,

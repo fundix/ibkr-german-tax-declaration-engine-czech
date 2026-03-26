@@ -366,6 +366,7 @@ class TestSummaryAggregation:
         resolver = _resolver()
         provider = MockCNBProvider(responses={date(2025, 3, 25): SAMPLE_CNB})
         converter = CzCurrencyConverter(provider=provider, policy=CzFxPolicyConfig())
+        from src.countries.cz.config import CzTaxConfig as _Cfg
 
         # Taxable: held 200 days
         rgl_taxable = _make_rgl(Decimal("500"), holding_days=200)
@@ -378,34 +379,38 @@ class TestSummaryAggregation:
         for rgl in [rgl_taxable, rgl_exempt, rgl_pending]:
             classifier.classify(rgl)
 
-        aggregator = CzechTaxAggregator(fx_converter=converter)
+        aggregator = CzechTaxAggregator(
+            config=_Cfg(annual_exempt_limit_enabled=False),
+            fx_converter=converter,
+        )
         result = aggregator.aggregate(
             [rgl_taxable, rgl_exempt, rgl_pending], [], resolver, 2025,
         )
 
-        sec = result.sections["cz_10_securities"]
+        s = result.sections["cz_10_summary"]
 
         # Counts
-        assert sec.line_items["item_count_total"] == Decimal(3)
-        assert sec.line_items["item_count_exempt"] == Decimal(1)
-        assert sec.line_items["item_count_pending"] == Decimal(1)
+        assert s.line_items["sec_item_count_total"] == Decimal(3)
+        assert s.line_items["sec_item_count_exempt"] == Decimal(1)
+        assert s.line_items["sec_item_count_pending"] == Decimal(1)
 
         # Taxable gains should only include the 200-day item (500 EUR → CZK)
         # and the pending item (300 EUR → CZK, included as conservative default)
-        taxable_czk = sec.line_items["taxable_gains_czk"]
+        taxable_czk = s.line_items["sec_taxable_gains_czk"]
         assert taxable_czk > Decimal(0)
 
-        # Exempt total should include the 1200-day item
-        exempt_czk = sec.line_items["exempt_total_czk"]
-        assert exempt_czk > Decimal(0)
+        # Exempt total should include the 1200-day item (time test)
+        exempt_tt = s.line_items["sec_exempt_time_test_czk"]
+        assert exempt_tt > Decimal(0)
 
         # Pending total should include the no-acq-date item
-        pending_czk = sec.line_items["pending_review_czk"]
+        pending_czk = s.line_items["sec_pending_czk"]
         assert pending_czk > Decimal(0)
 
     def test_items_in_country_result_have_taxability(self):
         resolver = _resolver()
-        aggregator = CzechTaxAggregator()
+        from src.countries.cz.config import CzTaxConfig as _Cfg
+        aggregator = CzechTaxAggregator(config=_Cfg(annual_exempt_limit_enabled=False))
 
         rgl = _make_rgl(Decimal("500"), holding_days=200)
         CzechTaxClassifier().classify(rgl)

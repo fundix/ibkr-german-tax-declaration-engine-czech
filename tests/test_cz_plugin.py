@@ -242,8 +242,10 @@ class TestCzechTaxClassifier:
 
 class TestCzechTaxAggregator:
     def setup_method(self):
-        self.aggregator = CzechTaxAggregator()
-        self.classifier = CzechTaxClassifier()
+        # Disable annual limit so these tests focus on bucketing, not limit logic
+        cfg = CzTaxConfig(annual_exempt_limit_enabled=False)
+        self.aggregator = CzechTaxAggregator(config=cfg)
+        self.classifier = CzechTaxClassifier(config=cfg)
         self.resolver = _make_mock_asset_resolver()
 
     def test_empty_input_returns_all_sections(self):
@@ -252,30 +254,28 @@ class TestCzechTaxAggregator:
         assert result.tax_year == 2023
         assert "cz_8_dividends" in result.sections
         assert "cz_8_interest" in result.sections
-        assert "cz_10_securities" in result.sections
-        assert "cz_10_options" in result.sections
+        assert "cz_10_summary" in result.sections
 
-    def test_stock_gains_appear_in_securities(self):
+    def test_stock_gains_appear_in_summary(self):
         rgl = _make_rgl(AssetCategory.STOCK, Decimal("500"))
         self.classifier.classify(rgl)
         result = self.aggregator.aggregate([rgl], [], self.resolver, 2023)
-        sec = result.sections["cz_10_securities"]
-        assert sec.line_items["taxable_gains_eur"] == Decimal("500.00")
+        s = result.sections["cz_10_summary"]
+        assert s.line_items["sec_taxable_gains_eur"] == Decimal("500.00")
 
-    def test_option_gains_appear_in_options(self):
+    def test_option_gains_appear_in_summary(self):
         rgl = _make_rgl(AssetCategory.OPTION, Decimal("300"))
         self.classifier.classify(rgl)
         result = self.aggregator.aggregate([rgl], [], self.resolver, 2023)
-        sec = result.sections["cz_10_options"]
-        assert sec.line_items["taxable_gains_eur"] == Decimal("300.00")
+        s = result.sections["cz_10_summary"]
+        assert s.line_items["opt_taxable_gains_eur"] == Decimal("300.00")
 
     def test_exempt_securities_not_in_taxable(self):
         rgl = _make_rgl(AssetCategory.STOCK, Decimal("500"), holding_period_days=1200)
         self.classifier.classify(rgl)
         result = self.aggregator.aggregate([rgl], [], self.resolver, 2023)
-        sec = result.sections["cz_10_securities"]
-        # Exempt items (cz_tax_section=CZ_EXEMPT_TIME_TEST) don't aggregate into securities
-        assert sec.line_items["taxable_gains_eur"] == Decimal("0.00")
+        s = result.sections["cz_10_summary"]
+        assert s.line_items["sec_taxable_gains_eur"] == Decimal("0.00")
 
     def test_dividends_from_events(self):
         events: List[FinancialEvent] = [
@@ -326,10 +326,10 @@ class TestCzechTaxAggregator:
         for rgl in rgls:
             self.classifier.classify(rgl)
         result = self.aggregator.aggregate(rgls, [], self.resolver, 2023)
-        sec = result.sections["cz_10_securities"]
-        assert sec.line_items["taxable_gains_eur"] == Decimal("500.00")
-        assert sec.line_items["deductible_losses_eur"] == Decimal("200.00")
-        assert sec.line_items["net_taxable_eur"] == Decimal("300.00")
+        s = result.sections["cz_10_summary"]
+        assert s.line_items["sec_taxable_gains_eur"] == Decimal("500.00")
+        assert s.line_items["sec_taxable_losses_eur"] == Decimal("200.00")
+        assert s.line_items["sec_net_taxable_eur"] == Decimal("300.00")
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +390,8 @@ class TestCzRegistry:
 class TestCzEndToEnd:
     def test_full_flow(self):
         """Simulate a small portfolio and verify the TaxResult structure."""
-        plugin = CzechTaxPlugin()
+        cfg = CzTaxConfig(annual_exempt_limit_enabled=False)
+        plugin = CzechTaxPlugin(config=cfg)
         classifier = plugin.get_tax_classifier()
         aggregator = plugin.get_tax_aggregator()
         resolver = _make_mock_asset_resolver()
@@ -419,23 +420,20 @@ class TestCzEndToEnd:
         assert result.tax_year == 2023
         assert len(result.sections) == 4
 
-        # Securities: 1000 (gain) + 200 (bond gain) taxable, 300 loss
-        # 800 exempt goes to CZ_EXEMPT_TIME_TEST section, not securities
-        sec = result.sections["cz_10_securities"]
-        assert sec.line_items["taxable_gains_eur"] == Decimal("1200.00")
-        assert sec.line_items["deductible_losses_eur"] == Decimal("300.00")
-        assert sec.line_items["net_taxable_eur"] == Decimal("900.00")
+        s = result.sections["cz_10_summary"]
+        # Securities: 1000 + 200 taxable gain, 300 loss (800 exempt by time test)
+        assert s.line_items["sec_taxable_gains_eur"] == Decimal("1200.00")
+        assert s.line_items["sec_taxable_losses_eur"] == Decimal("300.00")
+        assert s.line_items["sec_net_taxable_eur"] == Decimal("900.00")
 
         # Options: 500 gain, 100 loss
-        opt = result.sections["cz_10_options"]
-        assert opt.line_items["taxable_gains_eur"] == Decimal("500.00")
-        assert opt.line_items["deductible_losses_eur"] == Decimal("100.00")
-        assert opt.line_items["net_taxable_eur"] == Decimal("400.00")
+        assert s.line_items["opt_taxable_gains_eur"] == Decimal("500.00")
+        assert s.line_items["opt_taxable_losses_eur"] == Decimal("100.00")
+        assert s.line_items["opt_net_taxable_eur"] == Decimal("400.00")
 
-        # Dividends: 150 EUR dividend + 22.50 EUR unlinked WHT standalone item
-        # (unlinked WHT creates a standalone item in CZ_8_DIVIDENDS)
+        # Dividends: 150 EUR real dividend income (unlinked WHT goes to wht_paid only)
         div_sec = result.sections["cz_8_dividends"]
-        assert div_sec.line_items["gross_dividends_eur"] == Decimal("172.50")
+        assert div_sec.line_items["gross_dividends_eur"] == Decimal("150.00")
 
         # Interest
         intr = result.sections["cz_8_interest"]

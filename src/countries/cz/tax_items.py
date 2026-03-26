@@ -54,6 +54,7 @@ class CzTaxReviewStatus(Enum):
 class CzExemptionReason(Enum):
     """Why a CzTaxItem is exempt from Czech income tax."""
     TIME_TEST_PASSED = auto()      # §4/1/w ZDP — holding period exceeded
+    ANNUAL_LIMIT_NOT_EXCEEDED = auto()  # Annual proceeds below CZK threshold
     NOT_APPLICABLE = auto()        # Item type not subject to exemption test
 
 
@@ -146,13 +147,17 @@ class CzTaxItem:
     # --- Quantity (for disposals) ---
     quantity: Optional[Decimal] = None
 
-    # --- Taxability classification (set by CzTimeTestEvaluator) ---
+    # --- Taxability classification (set by time_test + annual_limit evaluators) ---
     is_taxable: bool = True
     is_exempt: bool = False
     exemption_reason: Optional[CzExemptionReason] = None
     included_in_tax_base: bool = True
     tax_review_status: CzTaxReviewStatus = CzTaxReviewStatus.RESOLVED
     tax_review_note: Optional[str] = None
+
+    # --- Annual exempt limit fields (set by annual_limit evaluator) ---
+    qualifies_for_annual_limit: bool = False   # eligible for the 100k test
+    exempt_due_to_annual_limit: bool = False    # actually exempted by it
 
     def total_wht_czk(self) -> Decimal:
         """Sum of all linked WHT amounts in CZK."""
@@ -195,6 +200,8 @@ class CzTaxItem:
         d["included_in_tax_base"] = self.included_in_tax_base
         d["tax_review_status"] = self.tax_review_status.name
         d["tax_review_note"] = self.tax_review_note
+        d["qualifies_for_annual_limit"] = self.qualifies_for_annual_limit
+        d["exempt_due_to_annual_limit"] = self.exempt_due_to_annual_limit
         # --- FX ---
         if self.fx is not None:
             d["fx_source"] = self.fx.fx_source

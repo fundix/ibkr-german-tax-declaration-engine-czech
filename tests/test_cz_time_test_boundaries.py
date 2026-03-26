@@ -210,16 +210,20 @@ class TestExemptLoss:
         for rgl in [rgl_gain, rgl_loss]:
             classifier.classify(rgl)
 
-        aggregator = CzechTaxAggregator(fx_converter=converter)
+        from src.countries.cz.config import CzTaxConfig as _Cfg
+        aggregator = CzechTaxAggregator(
+            config=_Cfg(annual_exempt_limit_enabled=False),
+            fx_converter=converter,
+        )
         result = aggregator.aggregate([rgl_gain, rgl_loss], [], resolver, 2025)
 
-        sec = result.sections["cz_10_securities"]
+        s = result.sections["cz_10_summary"]
         # Exempt loss should NOT be in deductible_losses
-        assert sec.line_items["deductible_losses_czk"] == Decimal("0.00")
+        assert s.line_items["sec_taxable_losses_czk"] == Decimal("0.00")
         # Only the taxable gain should be in taxable_gains
-        assert sec.line_items["taxable_gains_czk"] > Decimal("0")
-        # Exempt total should reflect the loss (absolute value)
-        assert sec.line_items["exempt_total_czk"] > Decimal("0")
+        assert s.line_items["sec_taxable_gains_czk"] > Decimal("0")
+        # Exempt total should reflect the loss (absolute value) under time_test
+        assert s.line_items["sec_exempt_time_test_czk"] > Decimal("0")
 
 
 # =========================================================================

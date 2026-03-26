@@ -38,18 +38,32 @@ class CzTaxConfig:
     # Securities acquired after 2014-01-01: exempt if held > 3 years.
     time_test_enabled: bool = True
     holding_test_years: int = 3
-    # PLACEHOLDER: CZK 100 000 annual limit on exempt disposals
-    # introduced by 2025 amendment; set to 0 to disable.
-    annual_exempt_limit_czk: Decimal = Decimal("0")
+    # Annual exempt limit for security disposal proceeds (2025+ amendment).
+    # If total gross disposal proceeds (proceeds_czk) for eligible items
+    # do not exceed this threshold, those items are exempt.
+    annual_exempt_limit_enabled: bool = True
+    annual_exempt_limit_czk: Decimal = Decimal("100000")
 
     @property
     def holding_test_days(self) -> int:
         """Threshold in days (years * 365). Item must exceed this to be exempt."""
         return self.holding_test_years * 365
 
-    # --- Withholding tax credit (§38f ZDP) ---
-    # Method: proportional credit (zápočet daně).
-    max_wht_credit_rate: Decimal = Decimal("0.15")
+    # --- Foreign tax credit / §38f ZDP (zápočet daně) ---
+    foreign_tax_credit_enabled: bool = True
+    # Default cap: creditable WHT cannot exceed this rate × gross income.
+    # 0.15 = 15 % is the Czech base tax rate and a common treaty cap.
+    default_max_credit_rate: Decimal = Decimal("0.15")
+    # Per-country treaty cap overrides (ISO-2 → max rate).
+    # If a country is NOT in this dict, default_max_credit_rate applies.
+    country_credit_caps: Dict[str, Decimal] = field(default_factory=lambda: {
+        # Examples — these are PLACEHOLDERS based on common SZDZ rates.
+        # Real values require treaty-by-treaty verification.
+        "US": Decimal("0.15"),
+        "DE": Decimal("0.15"),
+        "IE": Decimal("0.15"),
+        "GB": Decimal("0.15"),
+    })
 
     # --- CNB cache path ---
     cnb_cache_file_path: str = "cache/cnb_exchange_rates.json"
