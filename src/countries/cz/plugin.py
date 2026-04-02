@@ -36,6 +36,7 @@ from src.countries.cz.annual_limit import evaluate_annual_limit
 from src.countries.cz.foreign_tax_credit import CzForeignTaxCreditSummary, evaluate_foreign_tax_credit
 from src.countries.cz.item_builder import build_tax_items
 from src.countries.cz.loss_offsetting import CzLossOffsettingResult, compute_loss_offsetting
+from src.countries.cz.tax_liability import CzTaxLiabilitySummary, compute_tax_liability
 from src.countries.cz.tax_items import CzTaxItem, CzTaxItemType, CzTaxReviewStatus, CzWhtRecord
 from src.countries.cz.time_test import evaluate_time_test
 from src.domain.assets import Asset
@@ -211,16 +212,30 @@ class CzechTaxAggregator:
             notes=["PLACEHOLDER: expense deduction rules (§10/4 ZDP) not applied"],
         )
 
-        # Foreign tax credit summary
+        # Foreign tax credit summary (preliminary per-item caps)
         ftc_items = ftc_summary.to_line_items(cur)
         sections["cz_ftc_summary"] = TaxResultSection(
             section_key="cz_ftc_summary",
-            label="§38f ZDP – Zápočet zahraniční daně (preliminary)",
+            label="§38f ZDP – Zápočet zahraniční daně (per-item caps)",
             line_items=ftc_items,
-            notes=[
-                "PRELIMINARY: per-item credit cap only; "
-                "final §38f credit depends on total CZ tax liability (not yet computed)"
-            ],
+            notes=["Per-item treaty/default cap applied; final credit in liability summary"],
+        )
+
+        # --- Phase 7: Tax liability computation ---
+        liability = compute_tax_liability(
+            taxable_dividends=div_taxable,
+            taxable_interest=int_taxable,
+            netting=netting,
+            ftc_summary=ftc_summary,
+            config=self.config,
+        )
+
+        liability_items = liability.to_line_items(cur)
+        sections["cz_tax_liability"] = TaxResultSection(
+            section_key="cz_tax_liability",
+            label="Daňová povinnost (§16 + §38f ZDP)",
+            line_items=liability_items,
+            notes=liability.limitation_notes,
         )
 
         return TaxResult(
@@ -231,6 +246,7 @@ class CzechTaxAggregator:
                 "items": items,
                 "netting": netting,
                 "ftc_summary": ftc_summary,
+                "liability": liability,
                 "fx_conversion_records": fx_records,
                 "fx_policy": self.config.fx_policy,
                 "currency": cur,

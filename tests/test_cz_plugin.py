@@ -418,7 +418,7 @@ class TestCzEndToEnd:
         # Structure checks
         assert result.country_code == "cz"
         assert result.tax_year == 2023
-        assert len(result.sections) == 4
+        assert len(result.sections) == 5
 
         s = result.sections["cz_10_summary"]
         # Securities: 1000 + 200 taxable gain, 300 loss (800 exempt by time test)

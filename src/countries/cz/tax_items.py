@@ -202,6 +202,13 @@ class CzTaxItem:
         d["tax_review_note"] = self.tax_review_note
         d["qualifies_for_annual_limit"] = self.qualifies_for_annual_limit
         d["exempt_due_to_annual_limit"] = self.exempt_due_to_annual_limit
+        # --- Source country (from first WHT record) ---
+        src_country = None
+        for r in self.wht_records:
+            if r.source_country:
+                src_country = r.source_country
+                break
+        d["source_country"] = src_country
         # --- FX ---
         if self.fx is not None:
             d["fx_source"] = self.fx.fx_source
