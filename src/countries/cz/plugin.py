@@ -36,6 +36,7 @@ from src.countries.cz.annual_limit import evaluate_annual_limit
 from src.countries.cz.foreign_tax_credit import CzForeignTaxCreditSummary, evaluate_foreign_tax_credit
 from src.countries.cz.item_builder import build_tax_items
 from src.countries.cz.loss_offsetting import CzLossOffsettingResult, compute_loss_offsetting
+from src.countries.cz.form_mapping import CzFormMappingResult, build_form_mapping
 from src.countries.cz.tax_liability import CzTaxLiabilitySummary, compute_tax_liability
 from src.countries.cz.tax_items import CzTaxItem, CzTaxItemType, CzTaxReviewStatus, CzWhtRecord
 from src.countries.cz.time_test import evaluate_time_test
@@ -238,6 +239,17 @@ class CzechTaxAggregator:
             notes=liability.limitation_notes,
         )
 
+        # --- Phase 8: Form mapping (DAP-oriented output) ---
+        form_mapping = build_form_mapping(
+            liability=liability,
+            netting=netting,
+            ftc_summary=ftc_summary,
+            taxable_dividends=div_taxable,
+            taxable_interest=int_taxable,
+            currency=cur,
+            items=items,
+        )
+
         return TaxResult(
             country_code="cz",
             tax_year=tax_year,
@@ -247,6 +259,7 @@ class CzechTaxAggregator:
                 "netting": netting,
                 "ftc_summary": ftc_summary,
                 "liability": liability,
+                "form_mapping": form_mapping,
                 "fx_conversion_records": fx_records,
                 "fx_policy": self.config.fx_policy,
                 "currency": cur,
