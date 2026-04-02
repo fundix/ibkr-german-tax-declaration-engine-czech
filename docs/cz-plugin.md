@@ -1,0 +1,149 @@
+# Czech Republic Plugin (CZ)
+
+## Overview
+
+The CZ plugin (`src/countries/cz/`) computes Czech personal income tax figures from IBKR data. It produces audit-friendly output suitable as supporting documentation for the Czech tax return (Přiznání k dani z příjmů fyzických osob).
+
+> **This is not an official tax return.** Output must be verified by a tax professional before filing.
+
+## What It Does
+
+### Processing Pipeline
+
+```
+IBKR data → Core FIFO/enrichment → CzTaxItems
+  → Time test (§4/1/w)
+  → Annual exempt limit (100k CZK)
+  → §10 loss offsetting
+  → Foreign tax credit (§38f)
+  → Tax liability (15%/23%)
+  → Form mapping (DAP-oriented)
+  → JSON/XLSX export
+```
+
+### Income Classification
+
+| IBKR Event | CZ Bucket | Tax Section |
+|-----------|-----------|-------------|
+| Dividend (DIVIDEND_CASH) | CZ_8_DIVIDENDS | §8 ZDP |
+| Fund distribution | CZ_8_DIVIDENDS | §8 ZDP |
+| Interest | CZ_8_INTEREST | §8 ZDP |
+| Stock/bond/ETF sale | CZ_10_SECURITIES | §10 ZDP |
+| Option close/expiry | CZ_10_OPTIONS | §10 ZDP |
+
+### FX Conversion
+
+- **Default:** Daily ČNB rates (`CnbFxProvider`)
+- **Method:** Per-event, direct foreign→CZK (not through EUR as intermediate)
+- **Fallback:** Last valid rate for weekends/holidays
+- Every conversion produces an `FxConversionRecord` with full audit trail
+
+### Time Test (§4/1/w ZDP)
+
+Securities held longer than 3 years (1095 days) are exempt. Applied to `SECURITY_DISPOSAL` items only — not to dividends, interest, or options.
+
+If `acquisition_date` is missing, the item is marked `PENDING_MANUAL_REVIEW` and conservatively included in the tax base.
+
+### Annual Exempt Limit (100k CZK)
+
+If total gross disposal proceeds (`proceeds_czk`) for eligible security disposals do not exceed CZK 100,000, those items are exempt (2025+ amendment).
+
+- Uses `proceeds_czk` (gross proceeds), not gain/loss
+- Items already exempt by time test are excluded from the proceeds sum
+- Options are not eligible
+- All-or-nothing: if total exceeds threshold, ALL eligible items are taxable
+
+### Loss Offsetting (§10)
+
+Taxable gains and losses are netted separately for:
+- Securities (stocks, bonds, ETFs)
+- Options (derivatives)
+
+Only items with `included_in_tax_base=True` participate. Exempt losses do not reduce the tax base. Negative net results are floored at zero (loss carryforward not implemented).
+
+### Foreign Tax Credit (§38f ZDP)
+
+Per-item preliminary credit:
+```
+cap_rate = country_credit_caps.get(country, default_max_credit_rate)
+max_creditable = gross_income × cap_rate
+actual_creditable = min(wht_paid, max_creditable)
+```
+
+Final credit (after liability computation):
+```
+czech_tax_on_foreign = gross_tax × (foreign_income / combined_base)
+final_creditable = min(preliminary_creditable, czech_tax_on_foreign)
+```
+
+### Tax Liability
+
+```
+combined_base = dividends + interest + max(0, securities_net) + max(0, options_net)
+tax = base_portion × 15% + elevated_portion × 23%
+final_tax = gross_tax - final_creditable_ftc
+```
+
+### Form Mapping
+
+DAP-oriented output with stable internal line codes (e.g. `CZ_DAP_8_DIVIDENDS`, `CZ_DAP_10_SECURITIES`). Does not generate official form — serves as structured input for manual filing or future automation.
+
+## Known Limitations
+
+| Area | Status | Detail |
+|------|--------|--------|
+| Treaty verification | Placeholder | `country_credit_caps` are example values, not verified per-treaty |
+| Jednotný kurz (uniform rate) | Not implemented | Only daily ČNB rates supported |
+| Pre-2014 acquisition rule | Not implemented | 6-month rule for pre-2014 securities |
+| Expense deduction (§10/4) | Not implemented | `cost_basis_czk` available on items but rule not applied |
+| Loss carryforward | Not implemented | Negative §10 net floored at zero |
+| Multi-source taxpayer | Limitation | Elevated-rate threshold applies to IBKR income only; adjust if other income exists |
+| EUR intermediate on RGL | Known | Disposal amounts go EUR→CZK (core converts to EUR first) |
+| Official form line numbers | None | `official_line_ref` is `None` on all form lines |
+| Stock-for-stock mergers | Core limitation | `CORP_MERGER_STOCK` FIFO logic not fully implemented |
+
+## Configuration
+
+All CZ-specific settings are in `CzTaxConfig` (`src/countries/cz/config.py`):
+
+```python
+CzTaxConfig(
+    home_currency="CZK",
+    base_tax_rate=Decimal("0.15"),
+    elevated_tax_rate=Decimal("0.23"),
+    elevated_rate_threshold_czk=Decimal("1935552"),
+    time_test_enabled=True,
+    holding_test_years=3,
+    annual_exempt_limit_enabled=True,
+    annual_exempt_limit_czk=Decimal("100000"),
+    foreign_tax_credit_enabled=True,
+    default_max_credit_rate=Decimal("0.15"),
+    country_credit_caps={"US": Decimal("0.15"), ...},
+)
+```
+
+## Exports
+
+### JSON
+```python
+from src.countries.cz.exporters import export_cz_to_json
+json_str = export_cz_to_json(tax_result, output="report.json")
+```
+
+### XLSX
+```python
+from src.countries.cz.exporters import export_cz_to_xlsx
+export_cz_to_xlsx(tax_result, "report.xlsx")
+```
+
+XLSX sheets: Summary, Securities, Options, Dividends, Interest, WithholdingTax, PendingReview, Metadata.
+
+## Policy Assumptions
+
+These are explicitly documented in the code and output:
+
+1. **Elevated rate threshold** applies to total taxpayer income. This tool only sees IBKR income.
+2. **FTC proportional method** (§38f/1): `czech_tax × (foreign_income / total_base)`.
+3. **Treaty caps** are configurable placeholders — not verified against specific SZDZ texts.
+4. **Annual limit** uses `proceeds_czk` (gross disposal proceeds), matching the legislative term "příjem".
+5. **Time test** uses simple day count (holding_period_days > 3×365), not calendar-year boundary logic.
