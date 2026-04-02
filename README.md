@@ -17,6 +17,15 @@ A Python tool that automates the tedious parts of preparing tax declarations fro
 7. Applies **country-specific tax rules** via a plugin architecture.
 8. Generates audit-friendly reports (console, PDF, JSON, XLSX).
 
+## Project Status
+
+| Component | Status |
+|-----------|--------|
+| Core FIFO/enrichment | Stable — validated with 182 spec-driven tests |
+| German plugin (DE) | Production — validated for tax year 2023 |
+| Czech plugin (CZ) | Beta — functional but policy placeholders remain (see [known limitations](docs/cz-plugin.md#known-limitations)) |
+| Test suite | 444 tests passing |
+
 ## Supported Countries
 
 | Country | Plugin | Status | Output formats |

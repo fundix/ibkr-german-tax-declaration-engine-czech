@@ -162,6 +162,30 @@ def main_application():
             tax_year=tax_year
         )
 
+    # --- CZ JSON/XLSX export (if requested) ---
+    if args.output_json or args.output_xlsx:
+        if args.country == "cz":
+            # Build CZ TaxResult for export
+            from src.countries.registry import get_tax_plugin
+            cz_plugin = get_tax_plugin("cz")
+            cz_aggregator = cz_plugin.get_tax_aggregator()
+            cz_result = cz_aggregator.aggregate(
+                realized_gains_losses=processing_results.realized_gains_losses,
+                financial_events=processing_results.processed_income_events,
+                asset_resolver=processing_results.asset_resolver,
+                tax_year=config.TAX_YEAR,
+            )
+            if args.output_json:
+                from src.countries.cz.exporters.json_exporter import export_cz_to_json
+                export_cz_to_json(cz_result, output=args.output_json)
+                logger.info(f"CZ JSON export written to {args.output_json}")
+            if args.output_xlsx:
+                from src.countries.cz.exporters.xlsx_exporter import export_cz_to_xlsx
+                export_cz_to_xlsx(cz_result, output=args.output_xlsx)
+                logger.info(f"CZ XLSX export written to {args.output_xlsx}")
+        else:
+            logger.warning(f"JSON/XLSX export is currently only supported for --country cz, not '{args.country}'.")
+
     logger.info("Processing finished.")
     if processing_results.eoy_mismatch_error_count > 0:
         logger.warning(f"There were {processing_results.eoy_mismatch_error_count} EOY quantity mismatch errors. Review logs and output carefully.")

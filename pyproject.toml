@@ -1,7 +1,7 @@
 [project]
-name = "ibkr-german-tax-declaration-engine"
-version = "3.3.1"
-description = "Automate German tax declaration figures from Interactive Brokers Flex Query reports"
+name = "ibkr-tax-declaration-engine"
+version = "4.0.0"
+description = "Multi-country tax declaration engine for Interactive Brokers (DE + CZ)"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
@@ -12,6 +12,9 @@ dependencies = [
     "reportlab>=3.5.0",
     "openpyxl>=3.1.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/fundix/ibkr-german-tax-declaration-engine-czech"
 
 [dependency-groups]
 dev = [

@@ -34,6 +34,10 @@ def parse_arguments():
     parser.add_argument("--report-stock-trades-details", type=str, metavar="SYMBOL", help="Generate a detailed report of all trades for a given stock symbol in the tax year.")
     parser.add_argument("--pdf-output-file", type=str, default=None, help="Filename for the PDF report. Defaults to tax_report_<tax_year>.pdf if --report-tax-declaration is used.")
 
+    # Export options (primarily for CZ plugin)
+    parser.add_argument("--output-json", type=str, default=None, metavar="FILE", help="Export tax result to JSON file (CZ plugin).")
+    parser.add_argument("--output-xlsx", type=str, default=None, metavar="FILE", help="Export tax result to XLSX file (CZ plugin).")
+
     args = parser.parse_args()
 
     # Handle the tri-state for args.interactive:

@@ -168,8 +168,8 @@ wheels = [
 ]
 
 [[package]]
-name = "ibkr-german-tax-declaration-engine"
-version = "3.3.1"
+name = "ibkr-tax-declaration-engine"
+version = "4.0.0"
 source = { virtual = "." }
 dependencies = [
     { name = "openpyxl" },
